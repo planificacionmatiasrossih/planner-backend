@@ -362,9 +362,29 @@ function esUbicacionPlausibleRM(lat, lon){
     && lon>=RM_BBOX.lonMin && lon<=RM_BBOX.lonMax;
 }
 
+// Segundo filtro, más fino que el cajón de toda la Región Metropolitana: si
+// el pedido ya tiene identificada su comuna (con su centro aproximado), una
+// dirección geocodificada no debería caer a más de ~40km de ese centro. Esto
+// agarra el caso típico de Nominatim/Mapbox matcheando mal un nombre de
+// calle genérico con una calle del mismo nombre en OTRA comuna — que de otra
+// forma pasaría el chequeo de "¿está dentro de la RM?" sin problema, porque
+// la otra comuna también está dentro de la RM. 40km es generoso a propósito:
+// hay comunas rurales grandes (Melipilla, San José de Maipo, Til Til) donde
+// una punta a otra ya son varias decenas de km, así que preferimos ser
+// permisivos antes que descartar una dirección real.
+const RADIO_MAX_DESDE_COMUNA_KM = 40;
+function esUbicacionPlausibleParaStop(s, lat, lon){
+  if(!esUbicacionPlausibleRM(lat, lon)) return false;
+  const c=s && s._comunaInfo;
+  if(c && Number.isFinite(c.lat) && Number.isFinite(c.lon)){
+    return haversine(lon, lat, c.lon, c.lat) <= RADIO_MAX_DESDE_COMUNA_KM;
+  }
+  return true; // sin comuna identificada todavía: nos quedamos solo con el chequeo de la RM
+}
+
 async function geocodificarUno(s, force){
   const key=geoKey(s.direccion,s.comuna);
-  if(!force && geoCache[key] && esUbicacionPlausibleRM(geoCache[key].lat, geoCache[key].lon)){
+  if(!force && geoCache[key] && esUbicacionPlausibleParaStop(s, geoCache[key].lat, geoCache[key].lon)){
     s.lat=geoCache[key].lat; s.lon=geoCache[key].lon; s._geoExact=true; s._geoSource='cache'; return {ok:true,network:true};
   }
   const direccionParaBuscar=direccionBaseParaGeo(s.direccion);
@@ -375,7 +395,7 @@ async function geocodificarUno(s, force){
   // función devuelve null y seguimos con Nominatim exactamente como antes
   // — ningún comportamiento previo se pierde, Mapbox solo se suma arriba.
   const viaMapbox = await mapbox.geocodificarConMapbox(direccionParaBuscar, s.comuna);
-  if (viaMapbox && esUbicacionPlausibleRM(viaMapbox.lat, viaMapbox.lon)) {
+  if (viaMapbox && esUbicacionPlausibleParaStop(s, viaMapbox.lat, viaMapbox.lon)) {
     s.lat=viaMapbox.lat; s.lon=viaMapbox.lon; s._geoExact=true; s._geoSource='mapbox';
     geoCache[key]={lat:s.lat,lon:s.lon,savedAt:Date.now()}; guardarGeoCache(); return {ok:true,network:true};
   }
@@ -390,7 +410,7 @@ async function geocodificarUno(s, force){
     const data=await resp.json();
     const lat=data && data[0] && parseFloat(data[0].lat);
     const lon=data && data[0] && parseFloat(data[0].lon);
-    if(esUbicacionPlausibleRM(lat,lon)){
+    if(esUbicacionPlausibleParaStop(s,lat,lon)){
       s.lat=lat; s.lon=lon; s._geoExact=true; s._geoSource='nominatim';
       geoCache[key]={lat:s.lat,lon:s.lon,savedAt:Date.now()}; guardarGeoCache(); return {ok:true,network:true};
     }
@@ -779,12 +799,29 @@ function distanciaRutaNN(stops){
   return Math.round(total*FACTOR_DESVIO_VIAL*10)/10;
 }
 
+/* Guardarraíl contra "distancias imposibles": una ruta que reparte DENTRO de
+   la Región Metropolitana, con 20-25 paradas como mucho, nunca debería dar
+   varios cientos de km reales. Si una fuente externa (OSRM o Mapbox) dice lo
+   contrario, es mucho más probable que una dirección esté mal geocodificada
+   (match equivocado a otra ciudad/comuna lejana) que que la ruta sea así de
+   larga en realidad. En ese caso, se descarta ese número y se mantiene la
+   estimación de línea recta de siempre — igual que ya se hace cuando Mapbox
+   no responde. Esto protege sin importar POR QUÉ vino mal el dato. */
+const DISTANCIA_MAX_PLAUSIBLE_RM_KM = 220;
+function esDistanciaPlausible(distKm, estimadoBaseKm){
+  if(!Number.isFinite(distKm) || distKm<=0) return false;
+  if(distKm > DISTANCIA_MAX_PLAUSIBLE_RM_KM) return false;
+  if(Number.isFinite(estimadoBaseKm) && estimadoBaseKm>0 && distKm > estimadoBaseKm*3) return false;
+  return true;
+}
+
 /* Afina el ORDEN de las paradas de una ruta YA armada, usando distancia real
    de calle (OSRM, gratis) en vez de línea recta. Se usa una sola vez por
    ruta, al final — nunca dentro del algoritmo que arma/rebalancea las rutas
-   (ese sigue con línea recta, que es instantánea). Si OSRM no responde, no
-   cambia nada: se queda el orden que ya había calculado nearestNeighborDesdeLampa. */
-async function refinarOrdenConOSRM(r){
+   (ese sigue con línea recta, que es instantánea). Si OSRM no responde, o el
+   resultado es una distancia imposible (ver esDistanciaPlausible), no cambia
+   nada: se queda el orden que ya había calculado nearestNeighborDesdeLampa. */
+async function refinarOrdenConOSRM(r, estimadoBaseKm){
   if(!r.stopsOrdenados || r.stopsOrdenados.length<3) return;
   const stops=r.stopsOrdenados;
   const conCoord=stops.every(function(s){return Number.isFinite(s.lat)&&Number.isFinite(s.lon);});
@@ -794,16 +831,20 @@ async function refinarOrdenConOSRM(r){
   if(!matriz) return;
   const idxActual=stops.map(function(_,i){return i+1;});
   const idxOptimo=osrm.twoOptConMatriz(idxActual,matriz);
-  const nuevoOrden=idxOptimo.map(function(i){return stops[i-1];});
   let anterior=0, totalKm=0;
-  nuevoOrden.forEach(function(s,pos){
-    const actual=idxOptimo[pos];
-    const tramoKm=matriz[anterior][actual]/1000;
-    s.distTramoKm=Math.round(tramoKm*10)/10;
-    totalKm+=tramoKm;
+  idxOptimo.forEach(function(actual){
+    totalKm+=matriz[anterior][actual]/1000;
     anterior=actual;
   });
   totalKm+=matriz[anterior][0]/1000; // vuelta a la base
+  if(!esDistanciaPlausible(totalKm, estimadoBaseKm)) return; // dato imposible: se descarta entero (orden incluido)
+  const nuevoOrden=idxOptimo.map(function(i){return stops[i-1];});
+  anterior=0;
+  nuevoOrden.forEach(function(s,pos){
+    const actual=idxOptimo[pos];
+    s.distTramoKm=Math.round((matriz[anterior][actual]/1000)*10)/10;
+    anterior=actual;
+  });
   r.stopsOrdenados=nuevoOrden;
   r.distTotalKm=Math.round(totalKm*10)/10;
   r._ordenFuente='osrm';
@@ -1420,16 +1461,24 @@ async function planificar(pedidosRaw, fleetDisponible, onGeoProgress){
      tenía calculada — nunca rompe el resultado. */
   for(const r of rutasFinales){
     if(!r.patente || !r.stopsOrdenados || r.stopsOrdenados.length<2) continue;
+    // Guardamos la estimación de línea recta ANTES de tocar nada: es la vara
+    // con la que se mide si un resultado "real" (de OSRM o Mapbox) es
+    // creíble o es fruto de una dirección mal geocodificada.
+    const estimadoBaseKm=r.distTotalKm;
     // Paso 1 (gratis, sin límite mensual): OSRM reordena las paradas de esta
     // ruta usando distancia real de calle, en vez de línea recta. Si OSRM no
-    // responde, sigue con el orden de línea recta de siempre.
-    await refinarOrdenConOSRM(r);
+    // responde, o el resultado es un número imposible, sigue con el orden de
+    // línea recta de siempre.
+    await refinarOrdenConOSRM(r, estimadoBaseKm);
     // Paso 2: Mapbox le pone el km/tiempo final más preciso a ese orden ya
-    // (posiblemente) mejorado por OSRM. Si Mapbox falla, se queda el número
-    // que ya haya calculado el paso anterior.
+    // (posiblemente) mejorado por OSRM. Si Mapbox falla, o devuelve un
+    // número imposible para una ruta dentro de la Región Metropolitana, se
+    // queda el número que ya haya calculado el paso anterior.
     const puntos=[BASE_LAMPA, ...r.stopsOrdenados.map(function(s){return {lat:s.lat,lon:s.lon};})];
     const real = await mapbox.calcularRutaRealMapbox(puntos);
-    if(real){ r.distTotalKm=Math.round(real.km*10)/10; r.minutosRealesMapbox=Math.round(real.minutos); r._distanciaFuente='mapbox'; }
+    if(real && esDistanciaPlausible(real.km, estimadoBaseKm)){
+      r.distTotalKm=Math.round(real.km*10)/10; r.minutosRealesMapbox=Math.round(real.minutos); r._distanciaFuente='mapbox';
+    }
   }
 
   return {rutas:rutasFinales,imposibles:imposibles,sinClasificar:sinClasificar,paraOtraRegion:paraOtraRegion,excluidosMas13:excluidosMas13,sinCamion:sinCamion,fusionesSector:fusionesRealizadas,direccionesInconsistentes:direccionesInconsistentes};
