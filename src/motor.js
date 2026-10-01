@@ -14,6 +14,7 @@
 const fs = require('fs');
 const path = require('path');
 const mapbox = require('./mapbox.js');
+const osrm = require('./osrm.js');
 
 const GEO_CACHE_FILE = path.join(__dirname, '..', 'data', 'geo-cache.json');
 let geoCache = {};
@@ -778,6 +779,37 @@ function distanciaRutaNN(stops){
   return Math.round(total*FACTOR_DESVIO_VIAL*10)/10;
 }
 
+/* Afina el ORDEN de las paradas de una ruta YA armada, usando distancia real
+   de calle (OSRM, gratis) en vez de línea recta. Se usa una sola vez por
+   ruta, al final — nunca dentro del algoritmo que arma/rebalancea las rutas
+   (ese sigue con línea recta, que es instantánea). Si OSRM no responde, no
+   cambia nada: se queda el orden que ya había calculado nearestNeighborDesdeLampa. */
+async function refinarOrdenConOSRM(r){
+  if(!r.stopsOrdenados || r.stopsOrdenados.length<3) return;
+  const stops=r.stopsOrdenados;
+  const conCoord=stops.every(function(s){return Number.isFinite(s.lat)&&Number.isFinite(s.lon);});
+  if(!conCoord) return; // si falta alguna coordenada, no se arriesga el orden
+  const puntos=[{lat:BASE_LAMPA.lat,lon:BASE_LAMPA.lng}].concat(stops.map(function(s){return {lat:s.lat,lon:s.lon};}));
+  const matriz=await osrm.obtenerMatrizOSRM(puntos);
+  if(!matriz) return;
+  const idxActual=stops.map(function(_,i){return i+1;});
+  const idxOptimo=osrm.twoOptConMatriz(idxActual,matriz);
+  const nuevoOrden=idxOptimo.map(function(i){return stops[i-1];});
+  let anterior=0, totalKm=0;
+  nuevoOrden.forEach(function(s,pos){
+    const actual=idxOptimo[pos];
+    const tramoKm=matriz[anterior][actual]/1000;
+    s.distTramoKm=Math.round(tramoKm*10)/10;
+    totalKm+=tramoKm;
+    anterior=actual;
+  });
+  totalKm+=matriz[anterior][0]/1000; // vuelta a la base
+  r.stopsOrdenados=nuevoOrden;
+  r.distTotalKm=Math.round(totalKm*10)/10;
+  r._ordenFuente='osrm';
+  r._distanciaFuente='osrm';
+}
+
 function capacidadEfectivaDosVueltas(camion){
   return Math.max(0, Number(camion && camion.mts3) || 0) * MAX_VUELTAS_POR_CAMION;
 }
@@ -1388,6 +1420,13 @@ async function planificar(pedidosRaw, fleetDisponible, onGeoProgress){
      tenía calculada — nunca rompe el resultado. */
   for(const r of rutasFinales){
     if(!r.patente || !r.stopsOrdenados || r.stopsOrdenados.length<2) continue;
+    // Paso 1 (gratis, sin límite mensual): OSRM reordena las paradas de esta
+    // ruta usando distancia real de calle, en vez de línea recta. Si OSRM no
+    // responde, sigue con el orden de línea recta de siempre.
+    await refinarOrdenConOSRM(r);
+    // Paso 2: Mapbox le pone el km/tiempo final más preciso a ese orden ya
+    // (posiblemente) mejorado por OSRM. Si Mapbox falla, se queda el número
+    // que ya haya calculado el paso anterior.
     const puntos=[BASE_LAMPA, ...r.stopsOrdenados.map(function(s){return {lat:s.lat,lon:s.lon};})];
     const real = await mapbox.calcularRutaRealMapbox(puntos);
     if(real){ r.distTotalKm=Math.round(real.km*10)/10; r.minutosRealesMapbox=Math.round(real.minutos); r._distanciaFuente='mapbox'; }
@@ -1507,4 +1546,5 @@ module.exports = {
   FLEET,
   DEPOT,
   estadoUsoMapbox: mapbox.estadoUso,
+  estadoOSRM: osrm.estado,
 };

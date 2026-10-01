@@ -37,6 +37,13 @@ app.get('/api/uso-mapbox', (req, res) => {
   res.json({ ok: true, uso: motor.estadoUsoMapbox() });
 });
 
+// Para confirmar que OSRM (el afinado gratis del orden de las paradas) está
+// respondiendo: cuenta cuántas veces respondió bien y cuántas falló desde
+// que el servidor arrancó.
+app.get('/api/estado-osrm', (req, res) => {
+  res.json({ ok: true, osrm: motor.estadoOSRM() });
+});
+
 // La puerta de entrada principal: arma las rutas.
 app.post('/api/planificar', async (req, res) => {
   try {
