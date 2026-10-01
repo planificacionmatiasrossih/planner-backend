@@ -30,6 +30,13 @@ app.get('/api/salud', (req, res) => {
   res.json({ ok: true, mensaje: 'El servidor está funcionando', camionesEnFlota: motor.FLEET.length });
 });
 
+// Para chequear en cualquier momento cuánto se lleva usado del límite
+// gratis mensual de Mapbox (geocoding y cálculo de rutas reales), sin tener
+// que entrar al panel de Mapbox.
+app.get('/api/uso-mapbox', (req, res) => {
+  res.json({ ok: true, uso: motor.estadoUsoMapbox() });
+});
+
 // La puerta de entrada principal: arma las rutas.
 app.post('/api/planificar', async (req, res) => {
   try {

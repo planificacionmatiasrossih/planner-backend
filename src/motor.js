@@ -13,6 +13,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const mapbox = require('./mapbox.js');
 
 const GEO_CACHE_FILE = path.join(__dirname, '..', 'data', 'geo-cache.json');
 let geoCache = {};
@@ -352,6 +353,18 @@ async function geocodificarUno(s, force){
     s.lat=geoCache[key].lat; s.lon=geoCache[key].lon; s._geoExact=true; s._geoSource='cache'; return {ok:true,network:true};
   }
   const direccionParaBuscar=direccionBaseParaGeo(s.direccion);
+
+  // Primero se intenta con Mapbox (más preciso con direcciones con errores
+  // de tipeo o abreviaciones raras). Si no hay token configurado, si se
+  // llegó al límite seguro del mes, o si falla por cualquier motivo, esta
+  // función devuelve null y seguimos con Nominatim exactamente como antes
+  // — ningún comportamiento previo se pierde, Mapbox solo se suma arriba.
+  const viaMapbox = await mapbox.geocodificarConMapbox(direccionParaBuscar, s.comuna);
+  if (viaMapbox) {
+    s.lat=viaMapbox.lat; s.lon=viaMapbox.lon; s._geoExact=true; s._geoSource='mapbox';
+    geoCache[key]={lat:s.lat,lon:s.lon,savedAt:Date.now()}; guardarGeoCache(); return {ok:true,network:true};
+  }
+
   const query=encodeURIComponent((direccionParaBuscar||'')+', '+(s.comuna||'')+', Región Metropolitana, Chile');
   const ctrl=new AbortController(); const timer=setTimeout(function(){ctrl.abort();},9000);
   let networkOk=false;
@@ -1349,6 +1362,21 @@ async function planificar(pedidosRaw, fleetDisponible, onGeoProgress){
     }
   });
 
+  /* Afinado final de distancia/tiempo con Mapbox: el ORDEN de las paradas
+     ya quedó decidido arriba por el algoritmo de siempre (nearest neighbor +
+     2-opt, con línea recta — rápido y gratis, perfecto para decidir orden).
+     Acá, una sola vez por ruta ya armada, se le pregunta a Mapbox la
+     distancia y el tiempo REALES de manejo para esa secuencia de paradas.
+     Si Mapbox no está configurado, se pasó el límite seguro del mes, o la
+     consulta falla, se deja tal cual la aproximación por línea recta que ya
+     tenía calculada — nunca rompe el resultado. */
+  for(const r of rutasFinales){
+    if(!r.patente || !r.stopsOrdenados || r.stopsOrdenados.length<2) continue;
+    const puntos=[BASE_LAMPA, ...r.stopsOrdenados.map(function(s){return {lat:s.lat,lon:s.lon};})];
+    const real = await mapbox.calcularRutaRealMapbox(puntos);
+    if(real){ r.distTotalKm=Math.round(real.km*10)/10; r.minutosRealesMapbox=Math.round(real.minutos); r._distanciaFuente='mapbox'; }
+  }
+
   return {rutas:rutasFinales,imposibles:imposibles,sinClasificar:sinClasificar,paraOtraRegion:paraOtraRegion,excluidosMas13:excluidosMas13,sinCamion:sinCamion,fusionesSector:fusionesRealizadas,direccionesInconsistentes:direccionesInconsistentes};
 }
 
@@ -1462,4 +1490,5 @@ module.exports = {
   corredorOperativoDeStop,
   FLEET,
   DEPOT,
+  estadoUsoMapbox: mapbox.estadoUso,
 };
