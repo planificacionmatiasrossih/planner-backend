@@ -1,0 +1,13 @@
+{
+  "name": "planner-backend",
+  "version": "1.0.0",
+  "description": "Servidor del Planificador de Rutas (Torre de Despacho RM) - mismo motor de calculo, corriendo del lado del servidor.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^5.2.1"
+  }
+}
