@@ -71,8 +71,14 @@ async function geocodificarConMapbox(direccion, comuna) {
   if (!incrementarYRevisar('geocoding')) return null;
   try {
     const query = encodeURIComponent((direccion || '') + ', ' + (comuna || '') + ', Región Metropolitana, Chile');
+    // proximity + bbox: le decimos a Mapbox que priorice y limite los
+    // resultados a la zona de Santiago (caja que cubre la Región
+    // Metropolitana con margen), para que un nombre de calle genérico no
+    // termine matcheando una calle del mismo nombre en otra región de Chile.
     const url = 'https://api.mapbox.com/geocoding/v5/mapbox.places/' + query + '.json'
-      + '?access_token=' + TOKEN + '&limit=1&country=cl&language=es';
+      + '?access_token=' + TOKEN + '&limit=1&country=cl&language=es'
+      + '&proximity=-70.6865,-33.2845'
+      + '&bbox=-71.8,-34.6,-69.8,-32.5';
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 9000);
     let resp;

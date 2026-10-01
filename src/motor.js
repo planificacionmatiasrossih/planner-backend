@@ -347,9 +347,23 @@ function direccionBaseParaGeo(direccion){
   return m ? m[1].trim() : direccion;
 }
 
+// "Ubicación imposible": caja que cubre la Región Metropolitana con un
+// margen generoso. Cualquier coordenada que caiga afuera de esto (venga de
+// Mapbox, de Nominatim, o de algo ya guardado en el caché) se descarta como
+// si nunca hubiera llegado — esto existe porque Nominatim en particular
+// puede matchear mal un nombre de calle genérico (ej. "El Quillay") con una
+// calle del mismo nombre en otra región de Chile, a cientos de km, y sin
+// este chequeo esa coordenada mala queda guardada en el caché para siempre.
+const RM_BBOX = { latMin:-34.6, latMax:-32.5, lonMin:-71.8, lonMax:-69.8 };
+function esUbicacionPlausibleRM(lat, lon){
+  return Number.isFinite(lat) && Number.isFinite(lon)
+    && lat>=RM_BBOX.latMin && lat<=RM_BBOX.latMax
+    && lon>=RM_BBOX.lonMin && lon<=RM_BBOX.lonMax;
+}
+
 async function geocodificarUno(s, force){
   const key=geoKey(s.direccion,s.comuna);
-  if(!force && geoCache[key] && Number.isFinite(geoCache[key].lat) && Number.isFinite(geoCache[key].lon)){
+  if(!force && geoCache[key] && esUbicacionPlausibleRM(geoCache[key].lat, geoCache[key].lon)){
     s.lat=geoCache[key].lat; s.lon=geoCache[key].lon; s._geoExact=true; s._geoSource='cache'; return {ok:true,network:true};
   }
   const direccionParaBuscar=direccionBaseParaGeo(s.direccion);
@@ -360,7 +374,7 @@ async function geocodificarUno(s, force){
   // función devuelve null y seguimos con Nominatim exactamente como antes
   // — ningún comportamiento previo se pierde, Mapbox solo se suma arriba.
   const viaMapbox = await mapbox.geocodificarConMapbox(direccionParaBuscar, s.comuna);
-  if (viaMapbox) {
+  if (viaMapbox && esUbicacionPlausibleRM(viaMapbox.lat, viaMapbox.lon)) {
     s.lat=viaMapbox.lat; s.lon=viaMapbox.lon; s._geoExact=true; s._geoSource='mapbox';
     geoCache[key]={lat:s.lat,lon:s.lon,savedAt:Date.now()}; guardarGeoCache(); return {ok:true,network:true};
   }
@@ -373,8 +387,10 @@ async function geocodificarUno(s, force){
     if(!resp.ok) throw new Error('Nominatim HTTP '+resp.status);
     networkOk=true; // el servidor respondió: la red funciona, aunque no haya resultado para esta dirección puntual
     const data=await resp.json();
-    if(data && data[0] && Number.isFinite(parseFloat(data[0].lat)) && Number.isFinite(parseFloat(data[0].lon))){
-      s.lat=parseFloat(data[0].lat); s.lon=parseFloat(data[0].lon); s._geoExact=true; s._geoSource='nominatim';
+    const lat=data && data[0] && parseFloat(data[0].lat);
+    const lon=data && data[0] && parseFloat(data[0].lon);
+    if(esUbicacionPlausibleRM(lat,lon)){
+      s.lat=lat; s.lon=lon; s._geoExact=true; s._geoSource='nominatim';
       geoCache[key]={lat:s.lat,lon:s.lon,savedAt:Date.now()}; guardarGeoCache(); return {ok:true,network:true};
     }
   }catch(e){ s._geoError=e && e.name==='AbortError' ? 'Tiempo de espera agotado' : (e.message||'Error de geocodificación'); }
