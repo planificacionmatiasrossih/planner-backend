@@ -24,6 +24,22 @@ app.use(cors());
 // estándar en que un programa le manda datos a otro por internet).
 app.use(express.json({ limit: '10mb' }));
 
+// Clave de acceso simple: si está configurada la variable de entorno
+// API_KEY en Render, el servidor exige que cada pedido (menos el chequeo de
+// salud) venga con esa misma clave en el encabezado "x-api-key". Así, aunque
+// alguien encuentre la dirección del servidor, no puede pedirle que calcule
+// rutas (y gaste cupo de Mapbox) sin la clave. Si no se configura ninguna
+// clave, el servidor sigue funcionando abierto como hasta ahora.
+const API_KEY = process.env.API_KEY || '';
+app.use(function(req, res, next) {
+  if (!API_KEY) return next();
+  if (req.path === '/api/salud') return next();
+  if (req.get('x-api-key') !== API_KEY) {
+    return res.status(401).json({ ok: false, error: 'Clave de acceso inválida o faltante.' });
+  }
+  next();
+});
+
 // Puerta de entrada de prueba, para confirmar que el servidor está vivo
 // sin tener que mandarle datos complicados.
 app.get('/api/salud', (req, res) => {
