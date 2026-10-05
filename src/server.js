@@ -9,7 +9,13 @@
 
 const express = require('express');
 const cors = require('cors');
+const multer = require('multer');
 const motor = require('./motor.js');
+const programacion = require('./programacion.js');
+
+// Recibe los archivos subidos (los dos excel de SAP) directo en memoria, sin
+// guardarlos en disco — se procesan y se descartan en la misma pedida.
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
 
 const app = express();
 
@@ -72,6 +78,44 @@ app.post('/api/planificar', async (req, res) => {
   } catch (e) {
     console.error('Error en /api/planificar:', e);
     res.status(500).json({ ok: false, error: e.message || 'Error interno al planificar.' });
+  }
+});
+
+// Arma "la programación" (lo que hoy se pega a mano en la hoja CORREO) a
+// partir de los dos archivos que se descargan de SAP: el export de
+// "Documento de ventas" y el export VA05. Devuelve el Excel ya armado, listo
+// para descargar y enviar por correo, más un aviso de qué pedidos no se
+// pudieron cruzar (por si falta alguno en el VA05).
+app.post('/api/generar-programacion', upload.fields([
+  { name: 'exportVentas', maxCount: 1 },
+  { name: 'exportVA05', maxCount: 1 },
+]), async (req, res) => {
+  try {
+    const archivos = req.files || {};
+    const fVentas = archivos.exportVentas && archivos.exportVentas[0];
+    const fVA05 = archivos.exportVA05 && archivos.exportVA05[0];
+    if (!fVentas || !fVA05) {
+      return res.status(400).json({ ok: false, error: 'Faltan los dos archivos (exportVentas y exportVA05).' });
+    }
+    const { filas, pedidosSinVA05 } = await programacion.generarProgramacion(fVentas.buffer, fVA05.buffer);
+    // Por defecto devuelve los datos en JSON (así el mismo resultado sirve
+    // para armar el Excel en el navegador Y para mandarlo a Google Sheets,
+    // sin tener que subir los archivos dos veces). Si el pedido pide el
+    // Excel directo (?descargar=1), devuelve el archivo ya armado.
+    if (req.query.descargar) {
+      const buffer = await programacion.escribirExcelProgramacion(filas);
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', 'attachment; filename="programacion.xlsx"');
+      return res.send(Buffer.from(buffer));
+    }
+    const filasLimpias = filas.map((f) => {
+      const { _comuna, _direccion, _tieneVA05, ...resto } = f;
+      return resto;
+    });
+    res.json({ ok: true, filas: filasLimpias, pedidosSinVA05, encabezados: programacion.ENCABEZADOS_PROGRAMACION });
+  } catch (e) {
+    console.error('Error en /api/generar-programacion:', e);
+    res.status(500).json({ ok: false, error: e.message || 'Error interno al generar la programación.' });
   }
 });
 
