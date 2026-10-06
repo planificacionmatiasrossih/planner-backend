@@ -133,4 +133,63 @@ async function calcularRutaRealMapbox(puntos) {
   }
 }
 
-module.exports = { geocodificarConMapbox, calcularRutaRealMapbox, estadoUso };
+
+// Saca los nombres de comuna/localidad de un resultado de Mapbox. En Chile,
+// Mapbox informa la comuna como "place" (a veces "locality"). Se deja fuera
+// "district" porque ahí viene la PROVINCIA (p.ej. "Santiago"), que contiene
+// muchas comunas y daría falsos "coincide".
+function comunasDeFeature(f) {
+  const nombres = [];
+  const tipos = Array.isArray(f.place_type) ? f.place_type : [];
+  if ((tipos.includes('place') || tipos.includes('locality')) && f.text) nombres.push(f.text);
+  (f.context || []).forEach(function (c) {
+    const pref = String(c.id || '').split('.')[0];
+    if ((pref === 'place' || pref === 'locality') && c.text) nombres.push(c.text);
+  });
+  return nombres;
+}
+
+// Busca direcciones para el buscador del mapa. Devuelve una lista de
+// { nombre, lat, lon, comuna } o null si Mapbox no está disponible.
+async function buscarDireccionesMapbox(texto, limite) {
+  if (!TOKEN) return null;
+  if (!incrementarYRevisar('geocoding')) return null;
+  try {
+    const url = 'https://api.mapbox.com/geocoding/v5/mapbox.places/' + encodeURIComponent(texto) + '.json'
+      + '?access_token=' + TOKEN + '&limit=' + (limite || 6) + '&country=cl&language=es&autocomplete=true'
+      + '&proximity=-70.6865,-33.4489&bbox=-71.8,-34.6,-69.8,-32.5';
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 9000);
+    let resp;
+    try { resp = await fetch(url, { signal: ctrl.signal }); } finally { clearTimeout(timer); }
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    return (data.features || []).filter(f => Array.isArray(f.center)).map(function (f) {
+      return { nombre: f.place_name || f.text, lat: f.center[1], lon: f.center[0], comuna: comunasDeFeature(f)[0] || '' };
+    });
+  } catch (e) { return null; }
+}
+
+// Pregunta a Mapbox dónde queda una dirección SIN decirle la comuna (si se la
+// dijéramos, la respuesta saldría sesgada hacia la comuna que trae SAP y un
+// error no se notaría). Devuelve hasta 5 candidatos con su comuna, o null.
+async function candidatosComunaMapbox(direccion) {
+  if (!TOKEN) return null;
+  if (!incrementarYRevisar('geocoding')) return null;
+  try {
+    const url = 'https://api.mapbox.com/geocoding/v5/mapbox.places/' + encodeURIComponent((direccion || '') + ', Región Metropolitana, Chile') + '.json'
+      + '?access_token=' + TOKEN + '&limit=5&country=cl&language=es&types=address,poi'
+      + '&proximity=-70.6865,-33.4489&bbox=-71.8,-34.6,-69.8,-32.5';
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 9000);
+    let resp;
+    try { resp = await fetch(url, { signal: ctrl.signal }); } finally { clearTimeout(timer); }
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    return (data.features || []).map(function (f) {
+      return { comunas: comunasDeFeature(f), relevancia: f.relevance || 0, nombre: f.place_name || '' };
+    });
+  } catch (e) { return null; }
+}
+
+module.exports = { buscarDireccionesMapbox, candidatosComunaMapbox, geocodificarConMapbox, calcularRutaRealMapbox, estadoUso };

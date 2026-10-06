@@ -66,6 +66,34 @@ app.get('/api/estado-osrm', (req, res) => {
   res.json({ ok: true, osrm: motor.estadoOSRM() });
 });
 
+
+// Revisa si cada dirección coincide con su comuna (usa Mapbox). Es un aviso:
+// devuelve estado ok / distinta (con la comuna sugerida) / sin_datos.
+app.post('/api/validar-comunas', async (req, res) => {
+  try {
+    const items = (req.body && req.body.items) || [];
+    if (!Array.isArray(items)) return res.status(400).json({ ok: false, error: 'Falta "items" (lista de {direccion, comuna}).' });
+    const resultados = await motor.validarComunasLista(items.slice(0, 400));
+    res.json({ ok: true, resultados });
+  } catch (e) {
+    console.error('Error en /api/validar-comunas:', e);
+    res.status(500).json({ ok: false, error: e.message || 'Error interno al validar comunas.' });
+  }
+});
+
+// Buscador de direcciones del mapa (Mapbox, con la comuna de cada resultado).
+app.get('/api/buscar-direccion', async (req, res) => {
+  try {
+    const q = String(req.query.q || '').trim();
+    if (q.length < 3) return res.json({ ok: true, resultados: [] });
+    const resultados = await motor.buscarDireccionesMapbox(q, 6);
+    if (resultados === null) return res.json({ ok: false, error: 'Mapbox no disponible' });
+    res.json({ ok: true, resultados });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message || 'Error al buscar.' });
+  }
+});
+
 // La puerta de entrada principal: arma las rutas.
 app.post('/api/planificar', async (req, res) => {
   try {

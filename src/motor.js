@@ -1464,6 +1464,71 @@ function optimizarGlobalRutas(rutas, fleetDisponible){
   return {rutasNuevas:nuevas,reemplaza:rutasRM,cambios:cambios,costoAntes:costoInicial,costoDespues:mejorC,iteraciones:iters,camionesUsados:Object.keys(porPat).length,rutasUsadas:nuevas.length};
 }
 
+
+/* ======================================================================
+   VALIDACIÓN DIRECCIÓN ↔ COMUNA
+   SAP a veces trae la comuna equivocada para una dirección (p.ej. Alberto Lo
+   Seco 2270 como "Santiago" cuando es Quinta Normal). Se busca la dirección
+   en Mapbox SIN la comuna y se mira en qué comuna(s) aparece:
+     - si alguna coincide con la de SAP  → 'ok'
+     - si ninguna coincide y el mejor resultado está en otra comuna → 'distinta'
+       (con la comuna sugerida)
+     - si Mapbox no sabe / no hay datos → 'sin_datos' (no se alerta)
+   Es solo un aviso para revisar: nunca cambia la comuna por sí solo.
+   ====================================================================== */
+function _claveComunaComparable(c){
+  let k=comunaKeyResuelta(c);
+  k=norm(k).replace(/\s+/g,' ');
+  if(k==='SANTIAGO CENTRO') k='SANTIAGO';
+  return k;
+}
+function mismaComuna(a,b){ return _claveComunaComparable(a)===_claveComunaComparable(b); }
+
+const _cacheValidacionComuna=new Map();
+async function validarComunaDireccion(direccion, comunaSAP){
+  const dirBase=direccionBaseParaGeo(direccion);
+  const key=norm(dirBase)+'|'+_claveComunaComparable(comunaSAP);
+  if(_cacheValidacionComuna.has(key)) return _cacheValidacionComuna.get(key);
+  const cands=await mapbox.candidatosComunaMapbox(dirBase);
+  let res={estado:'sin_datos',sugerida:''};
+  if(cands && cands.length){
+    const conComuna=cands.filter(function(c){return c.comunas.length;});
+    if(conComuna.some(function(c){return c.comunas.some(function(n){return mismaComuna(n,comunaSAP);});})){
+      res={estado:'ok',sugerida:''};
+    } else if(conComuna.length && conComuna[0].relevancia>=0.8){
+      res={estado:'distinta',sugerida:conComuna[0].comunas[0],detalle:conComuna[0].nombre};
+    }
+  }
+  if(res.estado!=='sin_datos' || cands) _cacheValidacionComuna.set(key,res);
+  return res;
+}
+
+/* items: [{direccion, comuna}] → [{direccion, comuna, estado, sugerida}] (en el mismo orden). */
+async function validarComunasLista(items, maxConsultas){
+  const tope=maxConsultas||150;
+  const unicos=new Map();
+  items.forEach(function(it){
+    if(!it.direccion||!it.comuna) return;
+    const k=norm(direccionBaseParaGeo(it.direccion))+'|'+_claveComunaComparable(it.comuna);
+    if(!unicos.has(k)) unicos.set(k,it);
+  });
+  const claves=Array.from(unicos.keys()).slice(0,tope);
+  const resultados=new Map();
+  let idx=0;
+  async function worker(){
+    while(idx<claves.length){
+      const k=claves[idx++]; const it=unicos.get(k);
+      resultados.set(k,await validarComunaDireccion(it.direccion,it.comuna));
+    }
+  }
+  await Promise.all([worker(),worker(),worker(),worker()]);
+  return items.map(function(it){
+    const k=norm(direccionBaseParaGeo(it.direccion||''))+'|'+_claveComunaComparable(it.comuna||'');
+    const r=resultados.get(k)||{estado:'sin_datos',sugerida:''};
+    return {direccion:it.direccion,comuna:it.comuna,estado:r.estado,sugerida:r.sugerida||''};
+  });
+}
+
 async function planificar(pedidosRaw, fleetDisponible, onGeoProgress){
   (pedidosRaw||[]).forEach(normalizarVolumenLinea);
   const stopsAll=consolidar(pedidosRaw);
@@ -1497,6 +1562,16 @@ async function planificar(pedidosRaw, fleetDisponible, onGeoProgress){
   const forceKeys=new Set(); // en el servidor no hay botón de "forzar re-geocodificación"; siempre usa caché normal
   const geocodables=stopsAll.filter(function(s){return !s.esOtraRegion&&s._comunaInfo&&s.direccion;});
   if(geocodables.length) await geocodificarStops(geocodables,forceKeys,onGeoProgress);
+  /* Validación dirección ↔ comuna (aviso, no cambia nada). */
+  let alertasComuna=[];
+  try{
+    const aValidar=stopsAll.filter(function(s){return s.direccion&&s.comuna&&!s.esOtraRegion&&s._comunaInfo;});
+    const vr=await validarComunasLista(aValidar.map(function(s){return {direccion:s.direccion,comuna:s.comuna};}));
+    aValidar.forEach(function(s,i){
+      s._comunaValidacion=vr[i].estado;
+      if(vr[i].estado==='distinta'){ s._comunaSugerida=vr[i].sugerida; alertasComuna.push({pedido:s.pedido,direccion:s.direccion,comunaSAP:s.comuna,comunaSugerida:vr[i].sugerida}); }
+    });
+  }catch(e){ console.error('validación de comunas falló (se ignora):',e&&e.message); }
   stopsAll.forEach(function(s){if(!Number.isFinite(Number(s.lat))){const c=coordFallbackComuna(s);if(c){s.lat=c.lat;s.lon=c.lon;s._geoExact=false;s._geoSource='comuna';}}});
 
   // Regla de operación: >13 m³ siempre queda fuera de las rutas locales.
@@ -1828,7 +1903,7 @@ async function planificar(pedidosRaw, fleetDisponible, onGeoProgress){
     }
   }
 
-  return {rutas:rutasFinales,imposibles:imposibles,sinClasificar:sinClasificar,paraOtraRegion:paraOtraRegion,excluidosMas13:excluidosMas13,sinCamion:sinCamion,fusionesSector:fusionesRealizadas,optimizacionGlobal:optimizacionGlobal,direccionesInconsistentes:direccionesInconsistentes};
+  return {rutas:rutasFinales,imposibles:imposibles,sinClasificar:sinClasificar,paraOtraRegion:paraOtraRegion,excluidosMas13:excluidosMas13,sinCamion:sinCamion,fusionesSector:fusionesRealizadas,optimizacionGlobal:optimizacionGlobal,alertasComuna:alertasComuna,direccionesInconsistentes:direccionesInconsistentes};
 }
 
 function calcularEstadoRuta(r){
@@ -1943,5 +2018,7 @@ module.exports = {
   DEPOT,
   estadoUsoMapbox: mapbox.estadoUso,
   estadoOSRM: osrm.estado,
+  validarComunasLista,
+  buscarDireccionesMapbox: mapbox.buscarDireccionesMapbox,
   _interno: { consolidar, nearestNeighborDesdeLampa, distanciaRutaNN, _cruces, zonaOperativaDeStop, corredorOperativoDeStop, volCarga, coordStop, calcularDistanciaKm, BASE_LAMPA, claveDireccionStop, normalizarVolumenLinea },
 };
