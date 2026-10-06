@@ -119,6 +119,51 @@ app.post('/api/generar-programacion', upload.fields([
   }
 });
 
+// Dice qué campos necesita mapear el usuario para cada fuente (para armar
+// el selector de columnas del lado de Google Sheets), con una etiqueta en
+// castellano y cuáles son los nombres "de fábrica" que trae SAP (para
+// pre-seleccionar el más parecido si existe).
+app.get('/api/campos-programacion', (req, res) => {
+  res.json({
+    ok: true,
+    ventas: programacion.CAMPOS_VENTAS,
+    va05: programacion.CAMPOS_VA05,
+  });
+});
+
+// Igual que /api/generar-programacion, pero para cuando los datos no vienen
+// de un archivo subido sino ya leídos desde una pestaña de Google Sheets
+// (donde el usuario los pegó él mismo) — el navegador los lee por su cuenta
+// vía el Apps Script conectado y manda acá las filas ya en JSON, más el
+// mapeo de qué columna de la hoja corresponde a cada dato.
+app.post('/api/generar-programacion-sheets', (req, res) => {
+  try {
+    const { filasVentas, filasVA05, mapeoVentas, mapeoVA05 } = req.body || {};
+    if (!Array.isArray(filasVentas) || !Array.isArray(filasVA05) || !mapeoVentas || !mapeoVA05) {
+      return res.status(400).json({ ok: false, error: 'Faltan filasVentas/filasVA05/mapeoVentas/mapeoVA05.' });
+    }
+    if (!mapeoVentas.op || !mapeoVA05.op) {
+      return res.status(400).json({ ok: false, error: 'Falta indicar cuál columna es el número de pedido (OP) en alguna de las dos pestañas.' });
+    }
+    const { filas, pedidosSinVA05 } = programacion.generarProgramacionDesdeFilas(filasVentas, filasVA05, mapeoVentas, mapeoVA05);
+    if (req.query.descargar) {
+      return programacion.escribirExcelProgramacion(filas).then((buffer) => {
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', 'attachment; filename="programacion.xlsx"');
+        res.send(Buffer.from(buffer));
+      });
+    }
+    const filasLimpias = filas.map((f) => {
+      const { _comuna, _tieneVA05, ...resto } = f;
+      return resto;
+    });
+    res.json({ ok: true, filas: filasLimpias, pedidosSinVA05, encabezados: programacion.ENCABEZADOS_PROGRAMACION });
+  } catch (e) {
+    console.error('Error en /api/generar-programacion-sheets:', e);
+    res.status(500).json({ ok: false, error: e.message || 'Error interno al generar la programación.' });
+  }
+});
+
 const PUERTO = process.env.PORT || 3000;
 app.listen(PUERTO, () => {
   console.log(`Servidor del Planificador de Rutas escuchando en el puerto ${PUERTO}`);

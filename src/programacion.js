@@ -1,18 +1,21 @@
 // programacion.js — Arma automáticamente "la programación" (lo que hoy se
-// arma a mano copiando datos a la hoja CORREO) a partir de los DOS archivos
-// que se descargan de SAP:
-//   1) El export de "Documento de ventas" (columnas tipo Hoja1.0 / EXPORT.xlsx)
-//   2) El export de "Documento de ventas (VA05)" (columnas tipo Hoja 2 / prueba.XLSX)
+// arma a mano copiando datos a la hoja CORREO) a partir de dos fuentes de
+// datos de SAP: el export de "Documento de ventas" y el export de
+// "Documento de ventas (VA05)".
 //
-// No depende de nada que calcule el planificador: estos dos archivos de SAP
-// ya traen, por pedido (OP), todo lo que hace falta — incluido el número de
+// Puede recibir esas dos fuentes de dos formas distintas:
+//   A) Como archivos .xlsx subidos directo (generarProgramacion)
+//   B) Como filas ya leídas desde una pestaña de Google Sheets donde el
+//      usuario las pega él mismo (generarProgramacionDesdeFilas), con un
+//      "mapeo" que dice qué columna de la hoja corresponde a cada dato
+//      (porque el usuario elige el nombre de la pestaña y puede pegar los
+//      datos con encabezados levemente distintos a los de SAP).
+//
+// En ambos casos el motor de cruce es el mismo (generarProgramacionDesdeFilas):
+// no depende de nada que calcule el planificador — estos datos de SAP ya
+// traen, por pedido (OP), todo lo que hace falta, incluido el número de
 // ruta/transporte, el chofer y la patente que se asignaron en SAP. Por eso
-// esto se sube DESPUÉS de que la ruta ya quedó registrada en SAP (que es
-// exactamente el momento en que hoy se arma a mano en Excel).
-//
-// Si en algún archivo real los nombres de columna vienen levemente distintos
-// (espacios, mayúsculas), buscarEncabezado() los encuentra por coincidencia
-// flexible en vez de exigir el nombre exacto.
+// esto se usa DESPUÉS de que la ruta ya quedó registrada en SAP.
 
 const ExcelJS = require('exceljs');
 
@@ -24,6 +27,48 @@ const ENCABEZADOS_PROGRAMACION = [
   'RUTA', 'CONDUCTOR', 'PATENTE', 'OP', 'ENTREGA',
   'CLIENTE', 'REFERNCIA/OC', 'OBSERVACION', 'ALMACEN', 'VENDEDOR',
 ];
+
+// Campos lógicos que necesitamos de cada fuente, con una etiqueta en
+// castellano (para mostrar en el selector de columnas) y una lista de
+// nombres de columna "candidatos" — como vienen de fábrica en el export de
+// SAP — que se usan para adivinar automáticamente el mapeo (tanto al leer
+// un archivo como para pre-rellenar el selector cuando se lee de Sheets).
+const CAMPOS_VENTAS = [
+  { campo: 'op', etiqueta: 'Número de pedido (OP)', candidatos: ['Número de pedido', 'Numero de pedido'], clave: true },
+  { campo: 'entrega', etiqueta: 'N° de entrega', candidatos: ['Entrega'] },
+  { campo: 'cliente', etiqueta: 'Nombre del cliente', candidatos: ['Nombre del cliente'] },
+  { campo: 'referenciaOC', etiqueta: 'Referencia Orden de Compra', candidatos: ['Referencia Orden Compra'] },
+  { campo: 'ruta', etiqueta: 'N° de transporte (RUTA)', candidatos: ['Nº de transporte', 'N° de transporte', 'Numero de transporte'] },
+  { campo: 'patente', etiqueta: 'Patente', candidatos: ['Patente'] },
+  { campo: 'conductor', etiqueta: 'Nombre de Chofer', candidatos: ['Nombre de Chofer'] },
+  { campo: 'ciudad', etiqueta: 'Ciudad/DestMercancias', candidatos: ['Ciudad/DestMercancias'] },
+  { campo: 'comuna', etiqueta: 'Comuna/DestMercancias', candidatos: ['Comuna/DestMercancias'] },
+];
+const CAMPOS_VA05 = [
+  { campo: 'op', etiqueta: 'Documento de ventas (OP)', candidatos: ['Documento de ventas'], clave: true },
+  { campo: 'almacen', etiqueta: 'Almacén', candidatos: ['Almacén', 'Almacen'] },
+  { campo: 'vendedor', etiqueta: 'Creado por (vendedor)', candidatos: ['Creado por'] },
+  { campo: 'observacion', etiqueta: 'Descripción del motivo de pedido', candidatos: ['Descripción del motivo de pedido', 'Descripcion del motivo de pedido'] },
+];
+
+function textoLimpio(v) {
+  if (v == null) return '';
+  if (v instanceof Date) return v;
+  return String(v).trim();
+}
+function normalizar(s) {
+  return String(s || '').trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+// La misma corrección que ya tenías en la fórmula de Excel:
+// =IF(Comuna="SANTIAGO", Ciudad, Comuna)
+// SAP a veces informa la comuna real solo en el campo "Ciudad" y deja
+// "Comuna" en el valor genérico "SANTIAGO".
+function corregirComuna(ciudad, comuna) {
+  const c = textoLimpio(comuna).toUpperCase();
+  if (c === 'SANTIAGO') return textoLimpio(ciudad);
+  return textoLimpio(comuna);
+}
 
 // --- Lectura genérica de un .xlsx (primera hoja, primera fila = encabezados) ---
 async function leerFilasDeExcel(buffer) {
@@ -63,88 +108,48 @@ function limpiarValorCelda(v) {
   return v;
 }
 
-// Busca una columna por nombre tolerando mayúsculas/minúsculas y espacios
-// extra, para que un cambio menor en el export de SAP no rompa todo.
-function buscarValor(fila, nombresPosibles) {
-  const claves = Object.keys(fila);
-  for (const nombre of nombresPosibles) {
-    const objetivo = normalizar(nombre);
-    const clave = claves.find((k) => normalizar(k) === objetivo);
-    if (clave !== undefined) return fila[clave];
+// Dado un conjunto de filas (objetos {nombreColumna: valor}) y la lista de
+// campos que buscamos, adivina qué columna real corresponde a cada campo
+// comparando nombres sin importar mayúsculas/espacios. Devuelve un mapeo
+// {campo: nombreColumnaEncontrada} — lo mismo que arma el selector manual
+// del lado de Sheets, pero automático, para cuando viene de un archivo.
+function detectarMapeo(filas, campos) {
+  const mapeo = {};
+  if (!filas.length) return mapeo;
+  const headers = Object.keys(filas[0]);
+  for (const { campo, candidatos } of campos) {
+    for (const nombre of candidatos) {
+      const encontrado = headers.find((h) => normalizar(h) === normalizar(nombre));
+      if (encontrado) { mapeo[campo] = encontrado; break; }
+    }
   }
-  return '';
-}
-function normalizar(s) {
-  return String(s || '').trim().toLowerCase().replace(/\s+/g, ' ');
+  return mapeo;
 }
 
-function textoLimpio(v) {
-  if (v == null) return '';
-  if (v instanceof Date) return v;
-  return String(v).trim();
-}
-
-// La misma corrección que ya tenías en la fórmula de Excel:
-// =IF(Comuna="SANTIAGO", Ciudad, Comuna)
-// SAP a veces informa la comuna real solo en el campo "Ciudad" y deja
-// "Comuna" en el valor genérico "SANTIAGO".
-function corregirComuna(ciudad, comuna) {
-  const c = textoLimpio(comuna).toUpperCase();
-  if (c === 'SANTIAGO') return textoLimpio(ciudad);
-  return textoLimpio(comuna);
-}
-
-// --- Procesa el export de "Documento de ventas" (EXPORT.xlsx / Hoja1.0) ---
-// Devuelve un mapa OP -> datos, quedándose con la primera línea de cada
-// pedido (los datos de ruta/cliente/dirección son los mismos para todas las
-// líneas de un mismo pedido).
-function indexarExportVentas(filas) {
-  const porOP = new Map();
+// Indexa las filas de una fuente por su campo clave (OP), usando el mapeo
+// {campoLogico: nombreColumnaReal} para saber de qué columna sacar cada
+// dato. Se queda con la primera fila de cada clave (los datos son los
+// mismos para todas las líneas de un mismo pedido).
+function indexarPorMapeo(filas, mapeo, campoClave) {
+  const porClave = new Map();
+  const colClave = mapeo[campoClave];
+  if (!colClave) return porClave;
   for (const fila of filas) {
-    const op = textoLimpio(buscarValor(fila, ['Número de pedido', 'Numero de pedido']));
-    if (!op || porOP.has(op)) continue;
-    const ciudad = buscarValor(fila, ['Ciudad/DestMercancias']);
-    const comuna = buscarValor(fila, ['Comuna/DestMercancias']);
-    porOP.set(op, {
-      op,
-      entrega: textoLimpio(buscarValor(fila, ['Entrega'])),
-      cliente: textoLimpio(buscarValor(fila, ['Nombre del cliente'])),
-      referenciaOC: textoLimpio(buscarValor(fila, ['Referencia Orden Compra'])),
-      ruta: textoLimpio(buscarValor(fila, ['Nº de transporte', 'N° de transporte', 'Numero de transporte'])),
-      patente: textoLimpio(buscarValor(fila, ['Patente'])),
-      conductor: textoLimpio(buscarValor(fila, ['Nombre de Chofer'])),
-      comuna: corregirComuna(ciudad, comuna),
-      direccion: [textoLimpio(buscarValor(fila, ['Calle/DestMercancias'])), textoLimpio(buscarValor(fila, ['Nro. Edificio/DestMercancias']))].filter(Boolean).join(' '),
-    });
+    const clave = textoLimpio(fila[colClave]);
+    if (!clave || porClave.has(clave)) continue;
+    const obj = {};
+    for (const campo of Object.keys(mapeo)) obj[campo] = textoLimpio(fila[mapeo[campo]]);
+    porClave.set(clave, obj);
   }
-  return porOP;
+  return porClave;
 }
 
-// --- Procesa el export VA05 (prueba.XLSX / Hoja 2) ---
-function indexarExportVA05(filas) {
-  const porOP = new Map();
-  for (const fila of filas) {
-    const op = textoLimpio(buscarValor(fila, ['Documento de ventas']));
-    if (!op || porOP.has(op)) continue;
-    porOP.set(op, {
-      almacen: textoLimpio(buscarValor(fila, ['Almacén', 'Almacen'])),
-      vendedor: textoLimpio(buscarValor(fila, ['Creado por'])),
-      observacion: textoLimpio(buscarValor(fila, ['Descripción del motivo de pedido', 'Descripcion del motivo de pedido'])),
-    });
-  }
-  return porOP;
-}
-
-// --- Función principal: arma las filas de "la programación" ---
-// bufferExportVentas: el .xlsx de "Documento de ventas" (EXPORT.xlsx)
-// bufferExportVA05: el .xlsx de "Documento de ventas (VA05)" (prueba.XLSX)
-async function generarProgramacion(bufferExportVentas, bufferExportVA05) {
-  const [filasVentas, filasVA05] = await Promise.all([
-    leerFilasDeExcel(bufferExportVentas),
-    leerFilasDeExcel(bufferExportVA05),
-  ]);
-  const ventasPorOP = indexarExportVentas(filasVentas);
-  const va05PorOP = indexarExportVA05(filasVA05);
+// --- Función principal (común a ambas vías): arma las filas de "la
+// programación" a partir de filas ya leídas (de un archivo o de Sheets) más
+// el mapeo de columnas de cada fuente. ---
+function generarProgramacionDesdeFilas(filasVentas, filasVA05, mapeoVentas, mapeoVA05) {
+  const ventasPorOP = indexarPorMapeo(filasVentas, mapeoVentas, 'op');
+  const va05PorOP = indexarPorMapeo(filasVA05, mapeoVA05, 'op');
 
   const filasProgramacion = [];
   for (const [op, v] of ventasPorOP) {
@@ -161,8 +166,7 @@ async function generarProgramacion(bufferExportVentas, bufferExportVA05) {
       ALMACEN: extra.almacen || '-',
       VENDEDOR: extra.vendedor || '-',
       // Datos extra, no van en el Excel/Sheets final pero sirven para avisos.
-      _comuna: v.comuna,
-      _direccion: v.direccion,
+      _comuna: corregirComuna(v.ciudad, v.comuna),
       _tieneVA05: va05PorOP.has(op),
     });
   }
@@ -175,6 +179,17 @@ async function generarProgramacion(bufferExportVentas, bufferExportVA05) {
   const pedidosSinVA05 = filasProgramacion.filter((f) => !f._tieneVA05).map((f) => f.OP);
 
   return { filas: filasProgramacion, pedidosSinVA05 };
+}
+
+// --- Vía A: arma la programación a partir de los dos archivos .xlsx ---
+async function generarProgramacion(bufferExportVentas, bufferExportVA05) {
+  const [filasVentas, filasVA05] = await Promise.all([
+    leerFilasDeExcel(bufferExportVentas),
+    leerFilasDeExcel(bufferExportVA05),
+  ]);
+  const mapeoVentas = detectarMapeo(filasVentas, CAMPOS_VENTAS);
+  const mapeoVA05 = detectarMapeo(filasVA05, CAMPOS_VA05);
+  return generarProgramacionDesdeFilas(filasVentas, filasVA05, mapeoVentas, mapeoVA05);
 }
 
 // --- Genera el archivo .xlsx final, listo para enviar por correo ---
@@ -200,7 +215,11 @@ async function escribirExcelProgramacion(filas) {
 
 module.exports = {
   generarProgramacion,
+  generarProgramacionDesdeFilas,
+  detectarMapeo,
   escribirExcelProgramacion,
   ENCABEZADOS_PROGRAMACION,
-  corregirComuna, // exportado también por si el motor de geocodificación lo quiere usar
+  CAMPOS_VENTAS,
+  CAMPOS_VA05,
+  corregirComuna,
 };
