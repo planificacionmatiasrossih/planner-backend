@@ -142,6 +142,10 @@ const COMUNAS = {
   "BUIN":{sub:"SUR",lon:-70.7411,lat:-33.7333},
   "PAINE":{sub:"SUR",lon:-70.7419,lat:-33.8069},
   "CALERA DE TANGO":{sub:"SUR",lon:-70.7742,lat:-33.6386},
+  "PIRQUE":{sub:"SURORIENTE",lon:-70.5753,lat:-33.6678},
+  "MARIA PINTO":{sub:"SURPONIENTE",lon:-71.1217,lat:-33.5192},
+  "SAN JOSE DE MAIPO":{sub:"SURORIENTE",lon:-70.3519,lat:-33.6445},
+  "ALHUE":{sub:"SURPONIENTE",lon:-71.0897,lat:-34.0397},
 
   "PUENTE ALTO":{sub:"SURORIENTE",lon:-70.5756,lat:-33.6117},
   "LA FLORIDA":{sub:"SURORIENTE",lon:-70.5833,lat:-33.5333},
@@ -167,7 +171,7 @@ const MACRO_COLOR_HEX = {A:"#7C93B8", B:"#8FA888", C:"#B8916F", D:"#8F7CA6"};
 
 const PERIFERICO_SUR = new Set([
   "PADRE HURTADO","PENAFLOR","TALAGANTE","EL MONTE","MELIPILLA","CURACAVI",
-  "ISLA DE MAIPO","BUIN","PAINE","CALERA DE TANGO"
+  "ISLA DE MAIPO","BUIN","PAINE","CALERA DE TANGO","PIRQUE","MARIA PINTO","SAN JOSE DE MAIPO","ALHUE"
 ]);
 
 const CORREDORES = {
@@ -1757,10 +1761,7 @@ async function planificar(pedidosRaw, fleetDisponible, onGeoProgress){
   const asignacion=asignarCamionesPorSector(volPorCorredor,fleetDisponible);
   const rutas=[];
   const sinCamion=[];
-  if(excluidosMas13.length){
-    const cont13=nearestNeighborDesdeLampa(excluidosMas13);
-    rutas.push({zona:'REVISIÓN ESPECIAL >13 m³',zonaCodigo:'SOBRECARGA',corredorCodigo:'SOBRECARGA',corredorLabel:'Pedidos >13 m³',stops:excluidosMas13,volumen:excluidosMas13.reduce(function(a,s){return a+volCarga(s);},0),volumenRetiro:0,patente:null,meta:null,mts3:null,transportista:'TRANSPORTE PESADO / REVISIÓN',vueltaNumero:1,tipoVuelta:'CONTINGENCIA',estado:'CONTINGENCIA — >13 m³',stopsOrdenados:cont13,distTotalKm:distanciaRutaNN(cont13),_routeEngine:'Contingencia >13 m³'});
-  }
+  // (los pedidos >13 m³ se cargan más abajo como rutas "⚠ REVISAR", una por pedido)
 
   Object.keys(porCorredor).sort(function(a,b){return volPorCorredor[b]-volPorCorredor[a];}).forEach(function(corredor){
     const flotaSector=asignacion[corredor]||[];
@@ -1818,6 +1819,34 @@ async function planificar(pedidosRaw, fleetDisponible, onGeoProgress){
       optimizacionGlobal={aplicada:true,cambios:og.cambios,costoAntes:og.costoAntes,costoDespues:og.costoDespues,iteraciones:og.iteraciones,camionesUsados:og.camionesUsados,rutasUsadas:og.rutasUsadas};
     } else if(og){ optimizacionGlobal={aplicada:false,cambios:[],costoAntes:og.costoAntes,costoDespues:og.costoDespues,iteraciones:og.iteraciones}; }
   }catch(e){ console.error('optimizarGlobalRutas falló, se conservan las rutas originales:',e); }
+
+  /* Pedidos que las reglas dejan fuera del ruteo normal (más de 13 m³ o con
+     comuna que el sistema no reconoce) IGUAL se cargan en el resultado, cada
+     uno en una ruta "⚠ REVISAR", sin patente y con una advertencia en la propia
+     parada. Así nunca faltan pedidos en la programación y quien despacha ve
+     de inmediato cuáles hay que revisar a mano (transporte pesado o corregir
+     la dirección/comuna). */
+  function _rutaRevision(stopsRev, etiqueta, estado, motivo){
+    stopsRev.forEach(function(s){ s._alertaRevision=motivo; });
+    const ord=nearestNeighborDesdeLampa(stopsRev);
+    ord.forEach(function(s){ s._alertaRevision=motivo; });
+    return {zona:etiqueta,zonaCodigo:'REV',corredorCodigo:'REV',corredorLabel:etiqueta,stops:stopsRev,
+      volumen:stopsRev.reduce(function(a,s){return a+volCarga(s);},0),
+      volumenRetiro:stopsRev.filter(function(s){return s.esRetiro;}).reduce(function(a,s){return a+s.volumen;},0),
+      patente:null,meta:null,mts3:null,transportista:null,vueltaNumero:1,tipoVuelta:'REVISIÓN MANUAL',
+      estado:estado,requiereRevision:true,stopsOrdenados:ord,distTotalKm:distanciaRutaNN(ord),_routeEngine:'Revisión manual'};
+  }
+  excluidosMas13.forEach(function(s){
+    rutas.push(_rutaRevision([s],'⚠ REVISAR — supera 13 m³','⚠ REVISAR — supera 13 m³: requiere transporte pesado o varios viajes','Supera 13 m³ ('+(Number(s.volumen)||0).toFixed(1)+' m³): revisar transporte y dirección'));
+  });
+  const yaEnRutas=new Set(); rutas.forEach(function(r){(r.stops||[]).forEach(function(s){yaEnRutas.add(norm(s.pedido));});});
+  const sinComunaRev=sinClasificar.filter(function(s){return !yaEnRutas.has(norm(s.pedido));});
+  if(sinComunaRev.length){
+    rutas.push(_rutaRevision(sinComunaRev,'⚠ REVISAR — comuna no reconocida','⚠ REVISAR — comuna no reconocida: corrige la comuna/dirección','Comuna no reconocida ("'+'" ): corregir comuna o dirección y volver a optimizar'));
+    const r=rutas[rutas.length-1];
+    r.stops.forEach(function(s){ s._alertaRevision='Comuna no reconocida ("'+(s.comuna||'sin comuna')+'"): corregir comuna o dirección y volver a optimizar'; });
+    r.stopsOrdenados.forEach(function(s){ s._alertaRevision='Comuna no reconocida ("'+(s.comuna||'sin comuna')+'"): corregir comuna o dirección y volver a optimizar'; });
+  }
 
   // Fuera de RM queda aislado y no compite por la flota local.
   if(paraOtraRegion.length){
