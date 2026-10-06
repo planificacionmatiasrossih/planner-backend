@@ -83,6 +83,10 @@ const FLEET = [
   {patente:"VRZL20", mts3:100, meta:65, transportista:"SAN FELIPE", largoCm:1600, anchoCm:250, altoCm:250},
   {patente:"GKPS95", mts3:100, meta:65, transportista:"SAN FELIPE", largoCm:1600, anchoCm:250, altoCm:250},
 ];
+/* Regla operacional vigente: la meta de cada camión es el 70% de su capacidad física
+   (referencia, no tope absoluto; el tope duro sigue siendo el 100%). */
+const META_OPERACIONAL_PCT = 0.70;
+FLEET.forEach(function(f){ f.meta = Math.round(f.mts3*META_OPERACIONAL_PCT*10)/10; });
 
 const DEPOT = { nombre: "Av. La Siembra Poniente 3404, Lampa", lon: -70.6865, lat: -33.2845 };
 
@@ -186,7 +190,7 @@ const CORREDOR_LABEL = {
   C_SUR:"Sur", C_ORIENTE:"Suroriente", D_PERIFERICO:"Periférico Sur"
 };
 
-const COMUNA_ALIAS = {"COLINA-ESTACION":"COLINA","COLINA ESTACION":"COLINA","STGO":"SANTIAGO","STGO CENTRO":"SANTIAGO CENTRO"};
+const COMUNA_ALIAS = {"COLINA-ESTACION":"COLINA","COLINA ESTACION":"COLINA","STGO":"SANTIAGO","STGO CENTRO":"SANTIAGO CENTRO","EST.CENTRAL":"ESTACION CENTRAL","EST CENTRAL":"ESTACION CENTRAL","EST. CENTRAL":"ESTACION CENTRAL","PROVIDENCIA LA REINA":"LA REINA","PROVIDENCIA/LA REINA":"LA REINA"};
 
 const OTRAS_REGIONES = {
   // Valparaiso
@@ -712,7 +716,9 @@ function optimizarOrden2OptDesdeLampa(orden){
     const c=coordStop(s); return c?{lat:c.lat,lon:c.lon}:null;
   })).filter(Boolean);
   if(puntos.length!==orden.length+1) return orden;
-  function d(a,b){return calcularDistanciaKm(a,{lat:b.lat,lng:b.lon});}
+  /* Ambos puntos pueden venir como {lat,lon} (paradas/base): se normalizan a {lat,lng}.
+     (Antes solo se normalizaba el segundo y el 2-opt comparaba NaN, así que casi nunca mejoraba nada.) */
+  function d(a,b){return calcularDistanciaKm({lat:a.lat,lng:(a.lon!==undefined?a.lon:a.lng)},{lat:b.lat,lng:(b.lon!==undefined?b.lon:b.lng)});}
   let mejor=orden.slice();
   let mejorDist=0;
   for(let i=0;i<mejor.length;i++){
@@ -725,8 +731,8 @@ function optimizarOrden2OptDesdeLampa(orden){
   let cambio=true, iter=0;
   while(cambio && iter<80){
     cambio=false; iter++;
-    for(let i=0;i<mejor.length-2;i++){
-      for(let k=i+1;k<mejor.length-1;k++){
+    for(let i=0;i<mejor.length-1;i++){
+      for(let k=i+1;k<mejor.length;k++){
         const A=i===0?puntos[0]:{lat:mejor[i-1].lat,lon:mejor[i-1].lon};
         const B={lat:mejor[i].lat,lon:mejor[i].lon};
         const C={lat:mejor[k].lat,lon:mejor[k].lon};
@@ -744,7 +750,7 @@ function optimizarOrden2OptDesdeLampa(orden){
   return mejor;
 }
 
-function nearestNeighborDesdeLampa(stops){
+function nearestNeighborBase(stops){
   const pts=stops.map(function(s){
     const c=coordStop(s);
     return Object.assign({},s,c?{lat:c.lat,lon:c.lon}:{lat:null,lon:null});
@@ -781,6 +787,59 @@ function nearestNeighborDesdeLampa(stops){
     else s.distTramoKm=0;
   });
   return optimizada;
+}
+
+
+/* Clave de "misma dirección": calle + número (sin pisos/locales) + comuna. */
+function claveDireccionStop(s){
+  return norm(direccionBaseParaGeo(s.direccion)||'')+'|'+norm(comunaKeyResuelta(s.comuna));
+}
+
+/* Orden de visita con regla de RETIROS: los pedidos que empiezan con 600 se
+   visitan DESPUÉS de las entregas. Única excepción operativa: un retiro cuya
+   dirección es la misma de una entrega de la ruta se hace justo después de la
+   última entrega de esa dirección (el camión ya está ahí; volver después
+   costaría un retroceso entero sin ningún beneficio). El resto de los retiros
+   va al final, ordenados por cercanía. */
+function nearestNeighborDesdeLampa(stops){
+  const entregas=stops.filter(function(s){return !s.esRetiro;});
+  const retiros=stops.filter(function(s){return s.esRetiro;});
+  if(!entregas.length || !retiros.length) return nearestNeighborBase(stops);
+  const ordEnt=nearestNeighborBase(entregas);
+  const ultimoIdx=new Map();
+  ordEnt.forEach(function(s,i){ ultimoIdx.set(claveDireccionStop(s), i); });
+  const anclados=new Map(); const libres=[];
+  retiros.forEach(function(r){
+    const k=claveDireccionStop(r);
+    if(ultimoIdx.has(k)){ const i=ultimoIdx.get(k); (anclados.get(i)||anclados.set(i,[]).get(i)).push(r); }
+    else libres.push(r);
+  });
+  const orden=[];
+  ordEnt.forEach(function(s,i){
+    orden.push(s);
+    (anclados.get(i)||[]).forEach(function(r){
+      const c=coordStop(r);
+      orden.push(Object.assign({},r,c?{lat:c.lat,lon:c.lon}:{}, {_retiroEnMismaDireccion:true}));
+    });
+  });
+  // Retiros restantes: al final, siempre el más cercano al punto actual.
+  const pend=libres.map(function(r){const c=coordStop(r);return Object.assign({},r,c?{lat:c.lat,lon:c.lon}:{lat:null,lon:null});});
+  while(pend.length){
+    const ult=orden[orden.length-1];
+    let bi=0,bd=Infinity;
+    pend.forEach(function(p,i){
+      const d=(Number.isFinite(p.lat)&&Number.isFinite(ult.lat))?calcularDistanciaKm({lat:ult.lat,lng:ult.lon},{lat:p.lat,lng:p.lon}):0;
+      if(d<bd){bd=d;bi=i;}
+    });
+    orden.push(pend.splice(bi,1)[0]);
+  }
+  let cur={lat:BASE_LAMPA.lat,lng:BASE_LAMPA.lng};
+  orden.forEach(function(s){
+    const c=coordStop(s);
+    if(c){s.distTramoKm=Math.round(calcularDistanciaKm(cur,{lat:c.lat,lng:c.lon})*10)/10;cur={lat:c.lat,lng:c.lon};}
+    else s.distTramoKm=0;
+  });
+  return orden;
 }
 
 function distanciaRutaNN(stops){
@@ -1130,6 +1189,281 @@ function recalcularRuta(r){
   r.estado = calcularEstadoRuta(r);
 }
 
+
+/* ======================================================================
+   OPTIMIZADOR GEOGRÁFICO GLOBAL
+   Después de armar las rutas por corredor, revisa TODAS las rutas juntas y
+   busca mejorarlas moviendo e intercambiando pedidos entre camiones, y
+   cerrando rutas que no se justifican. Reglas (en orden de prioridad):
+     1. Nunca separa un pedido; los pedidos con la misma dirección viajan
+        siempre juntos (se mueven como un solo bloque).
+     2. Coherencia geográfica / menor distancia / sin cruces ni retrocesos.
+     3. Capacidad: tope duro 100% de la capacidad física; la meta del 70% es
+        solo una referencia (penalización suave por pasarse, ninguna por
+        quedar debajo: la geografía gana sobre el llenado).
+   ====================================================================== */
+const OPT_FIJO_POR_RUTA_KM = 12;      // costo equivalente de sacar una vuelta más
+const OPT_PENAL_SOBRE_META_KM_M3 = 4; // km-equivalentes por m³ sobre el 70%
+const OPT_PENAL_CRUCE_KM = 15;        // por cada cruce de la ruta consigo misma
+const OPT_PENAL_MACRO_KM = 20;        // por cada macro-sector extra mezclado
+const OPT_DIAMETRO_LIBRE_KM = 22;     // una ruta compacta no pasa de ~18 km entre sus puntos más lejanos
+const OPT_PENAL_DIAMETRO_KM = 5.0;    // km-equivalentes por cada km de más
+const OPT_PRESUPUESTO_MS = 4000;
+
+function _rng(seed){ let a=seed>>>0; return function(){ a|=0; a=a+0x6D2B79F5|0; let t=Math.imul(a^a>>>15,1|a); t=t+Math.imul(t^t>>>7,61|t)^t; return ((t^t>>>14)>>>0)/4294967296; }; }
+
+function _cruces(orden){
+  const pts=[{x:BASE_LAMPA.lng,y:BASE_LAMPA.lat}];
+  orden.forEach(function(s){ const c=coordStop(s); if(!c) return; const p={x:c.lon,y:c.lat}; const q=pts[pts.length-1]; if(Math.abs(p.x-q.x)>1e-5||Math.abs(p.y-q.y)>1e-5) pts.push(p); });
+  pts.push({x:BASE_LAMPA.lng,y:BASE_LAMPA.lat});
+  function ccw(a,b,c){ return (c.y-a.y)*(b.x-a.x)-(b.y-a.y)*(c.x-a.x); }
+  function inter(a,b,c,d){ const d1=ccw(a,b,c),d2=ccw(a,b,d),d3=ccw(c,d,a),d4=ccw(c,d,b); return ((d1>0)!==(d2>0)) && ((d3>0)!==(d4>0)) && d1!==0 && d2!==0 && d3!==0 && d4!==0; }
+  let n=0;
+  for(let i=0;i<pts.length-1;i++) for(let j=i+2;j<pts.length-1;j++){
+    if(i===0 && j===pts.length-2) continue; // primer y último tramo comparten la base
+    if(inter(pts[i],pts[i+1],pts[j],pts[j+1])) n++;
+  }
+  return n;
+}
+
+function optimizarGlobalRutas(rutas, fleetDisponible){
+  const t0=Date.now();
+  const rutasRM=rutas.filter(function(r){ return r.stops && r.stops.length && r.zonaCodigo!=='EXT'; });
+  if(!rutasRM.length || !fleetDisponible || !fleetDisponible.length) return null;
+
+  // --- Bloques indivisibles: mismo pedido = 1 parada; misma dirección = 1 bloque ---
+  const unidades=[]; const porClave=new Map();
+  const origenDe={}; // pedido -> etiqueta de ruta original
+  rutasRM.forEach(function(r){
+    const et=(r.patente||'SIN CAMIÓN')+' V'+(r.vueltaNumero||1);
+    r.stops.forEach(function(s){
+      origenDe[norm(s.pedido)]=et;
+      const k=claveDireccionStop(s);
+      if(!porClave.has(k)){ const u={id:unidades.length,stops:[],vol:0,key:k}; porClave.set(k,u); unidades.push(u); }
+      const u=porClave.get(k); u.stops.push(s); u.vol+=volCarga(s);
+    });
+  });
+
+  // --- Espacios disponibles (camión × vuelta). Se usan primero los camiones ya asignados. ---
+  const usados=[]; rutasRM.forEach(function(r){ if(r.patente && usados.indexOf(r.patente)<0) usados.push(r.patente); });
+  const camiones=[]; usados.forEach(function(p){ const f=fleetDisponible.find(function(x){return x.patente===p;}); if(f) camiones.push(f); });
+  fleetDisponible.forEach(function(f){ if(camiones.length<usados.length+1 && camiones.indexOf(f)<0) camiones.push(f); });
+  const slots=[];
+  camiones.forEach(function(f){ for(let v=1; v<=MAX_VUELTAS_POR_CAMION; v++) slots.push({camion:f,vuelta:v,cap:f.mts3,meta:f.meta}); });
+  const maxCap=Math.max.apply(null,slots.map(function(s){return s.cap;}));
+  if(unidades.some(function(u){return u.vol>maxCap+1e-9;})) return null;
+
+  // Matrices de distancia entre bloques (una sola vez) para evaluar rutas rápido.
+  const nU=unidades.length;
+  unidades.forEach(function(u){ const c=coordStop(u.stops[0])||{lat:BASE_LAMPA.lat,lon:BASE_LAMPA.lng}; u.lat=c.lat; u.lon=c.lon; u.macro=zonaOperativaDeStop(u.stops[0])||'?'; });
+  const dep=unidades.map(function(u){return calcularDistanciaKm({lat:BASE_LAMPA.lat,lng:BASE_LAMPA.lng},{lat:u.lat,lng:u.lon});});
+  const DM=unidades.map(function(a){return unidades.map(function(b){return calcularDistanciaKm({lat:a.lat,lng:a.lon},{lat:b.lat,lng:b.lon});});});
+  function ordenRapido(ids){
+    const n=ids.length; if(n===1) return {ord:ids.slice(),km:2*dep[ids[0]]*FACTOR_DESVIO_VIAL};
+    const pend=ids.slice(); const ord=[]; let cur=-1;
+    while(pend.length){ let bi=0,bd=Infinity; for(let i=0;i<pend.length;i++){ const d=cur<0?dep[pend[i]]:DM[cur][pend[i]]; if(d<bd){bd=d;bi=i;} } cur=pend.splice(bi,1)[0]; ord.push(cur); }
+    const d=function(a,b){ return a<0?dep[b]:(b<0?dep[a]:DM[a][b]); };
+    let mejora=true,it=0;
+    while(mejora && it<30){ mejora=false; it++;
+      for(let i=0;i<n-1;i++) for(let k=i+1;k<n;k++){
+        const A=i===0?-1:ord[i-1],B=ord[i],C=ord[k],D=k===n-1?-1:ord[k+1];
+        if(d(A,C)+d(B,D)+1e-9<d(A,B)+d(C,D)){ const seg=ord.slice(i,k+1).reverse(); for(let q=0;q<seg.length;q++) ord[i+q]=seg[q]; mejora=true; }
+      }
+    }
+    let km=0,prev=-1; ord.forEach(function(x){ km+=d(prev,x); prev=x; }); km+=d(prev,-1);
+    return {ord:ord,km:km*FACTOR_DESVIO_VIAL};
+  }
+  function crucesIds(ord){ return _cruces(ord.map(function(id){return {lat:unidades[id].lat,lon:unidades[id].lon};})); }
+
+  const cache=new Map();
+  function costoSlot(si,ids){
+    if(!ids.length) return 0;
+    const key=si+':'+ids.slice().sort(function(a,b){return a-b;}).join(',');
+    let v=cache.get(key); if(v!==undefined) return v;
+    let vol=0; ids.forEach(function(id){ vol+=unidades[id].vol; });
+    const orr=ordenRapido(ids);
+    let c=orr.km+OPT_FIJO_POR_RUTA_KM+OPT_PENAL_CRUCE_KM*crucesIds(orr.ord);
+    const sl=slots[si];
+    if(vol>sl.cap+1e-9) c+=1000+1000*(vol-sl.cap);
+    else if(vol>sl.meta+1e-9) c+=OPT_PENAL_SOBRE_META_KM_M3*(vol-sl.meta);
+    const macros=new Set(ids.map(function(id){return unidades[id].macro;})).size;
+    c+=OPT_PENAL_MACRO_KM*(macros-1);
+    let diam=0; for(let i=0;i<ids.length;i++) for(let j=i+1;j<ids.length;j++){ if(DM[ids[i]][ids[j]]>diam) diam=DM[ids[i]][ids[j]]; }
+    if(diam>OPT_DIAMETRO_LIBRE_KM) c+=OPT_PENAL_DIAMETRO_KM*(diam-OPT_DIAMETRO_LIBRE_KM);
+    cache.set(key,c); return c;
+  }
+
+  function clonar(st){ return st.map(function(a){return a.slice();}); }
+  function total(st){ let t=0; st.forEach(function(ids,si){ t+=costoSlot(si,ids); }); return t; }
+  function mejorar(st){
+    let mejora=true, it=0;
+    while(mejora && it<60 && Date.now()-t0<OPT_PRESUPUESTO_MS){
+      mejora=false; it++;
+      // relocate
+      for(let a=0;a<st.length;a++){
+        for(const id of st[a].slice()){
+          const ca=costoSlot(a,st[a]); const sinU=st[a].filter(function(x){return x!==id;});
+          const caNew=costoSlot(a,sinU);
+          let mejorB=-1,mejorD=-1e-6;
+          for(let b=0;b<st.length;b++){ if(b===a) continue;
+            const d=caNew+costoSlot(b,st[b].concat([id]))-ca-costoSlot(b,st[b]);
+            if(d<mejorD){mejorD=d;mejorB=b;} }
+          if(mejorB>=0){ st[a]=sinU; st[mejorB].push(id); mejora=true; }
+        }
+      }
+      // swap
+      for(let a=0;a<st.length;a++) for(let b=a+1;b<st.length;b++){
+        for(const x of st[a].slice()) for(const y of st[b].slice()){
+          if(st[a].indexOf(x)<0||st[b].indexOf(y)<0) continue;
+          const na=st[a].filter(function(i){return i!==x;}).concat([y]);
+          const nb=st[b].filter(function(i){return i!==y;}).concat([x]);
+          const d=costoSlot(a,na)+costoSlot(b,nb)-costoSlot(a,st[a])-costoSlot(b,st[b]);
+          if(d<-1e-6){ st[a]=na; st[b]=nb; mejora=true; }
+        }
+      }
+      // cerrar una ruta repartiendo sus bloques en las demás
+      for(let a=0;a<st.length;a++){
+        if(!st[a].length) continue;
+        const copia=clonar(st); const mover=copia[a].slice(); copia[a]=[]; let ok=true;
+        mover.sort(function(p,q){return unidades[q].vol-unidades[p].vol;});
+        for(const id of mover){
+          let bb=-1,bd=Infinity;
+          for(let b=0;b<copia.length;b++){ if(b===a) continue; const d=costoSlot(b,copia[b].concat([id]))-costoSlot(b,copia[b]); if(d<bd){bd=d;bb=b;} }
+          if(bb<0){ok=false;break;} copia[bb].push(id);
+        }
+        if(ok && total(copia)<total(st)-1e-6){ for(let i=0;i<st.length;i++) st[i]=copia[i]; mejora=true; }
+      }
+    }
+    return st;
+  }
+
+  // --- Solución inicial A: la que ya armó el motor ---
+  const stA=slots.map(function(){return [];});
+  const ocup=new Set();
+  rutasRM.forEach(function(r){
+    let si=slots.findIndex(function(s,i){return s.camion.patente===r.patente && s.vuelta===(r.vueltaNumero||1) && !ocup.has(i);});
+    if(si<0) si=slots.findIndex(function(s,i){return !ocup.has(i);});
+    if(si<0) si=0;
+    ocup.add(si);
+    const ids=new Set(); r.stops.forEach(function(s){ ids.add(porClave.get(claveDireccionStop(s)).id); });
+    ids.forEach(function(id){ stA[si].push(id); });
+  });
+  // evitar duplicados si una ruta cayó en un slot ya usado
+  const vistos=new Set(); stA.forEach(function(ids,si){ stA[si]=ids.filter(function(id){ if(vistos.has(id)) return false; vistos.add(id); return true; }); });
+  const costoInicial=total(stA);
+
+  // --- Solución inicial B: inserción desde cero (más lejanos primero) ---
+  const stB=slots.map(function(){return [];});
+  unidades.slice().sort(function(p,q){
+    const cp=coordStop(p.stops[0]),cq=coordStop(q.stops[0]);
+    return calcularDistanciaKm({lat:BASE_LAMPA.lat,lng:BASE_LAMPA.lng},{lat:cq.lat,lng:cq.lon})-calcularDistanciaKm({lat:BASE_LAMPA.lat,lng:BASE_LAMPA.lng},{lat:cp.lat,lng:cp.lon});
+  }).forEach(function(u){
+    let bb=0,bd=Infinity;
+    for(let b=0;b<stB.length;b++){ const d=costoSlot(b,stB[b].concat([u.id]))-costoSlot(b,stB[b]); if(d<bd){bd=d;bb=b;} }
+    stB[bb].push(u.id);
+  });
+
+  // --- Soluciones iniciales C(k): agrupar por cercanía en k grupos (k-means sobre ubicación) ---
+  const semillas=[stA,stB];
+  const volTotal=unidades.reduce(function(a,u){return a+u.vol;},0);
+  const slotsOrd=slots.map(function(sl,i){return i;}).sort(function(a,b){return slots[b].cap-slots[a].cap;});
+  const kMin=Math.max(1,Math.ceil(volTotal/Math.max.apply(null,slots.map(function(x){return x.cap;}))));
+  for(let k=kMin;k<=Math.min(slots.length,kMin+3);k++){
+    const g=kmeansSplit(unidades.map(function(u){return {id:u.id,_comunaInfo:{lat:u.lat,lon:u.lon},lat:u.lat,lon:u.lon};}),k);
+    const st=slots.map(function(){return [];});
+    g.sort(function(a,b){ const va=a.reduce(function(x,u){return x+unidades[u.id].vol;},0), vb=b.reduce(function(x,u){return x+unidades[u.id].vol;},0); return vb-va; });
+    g.forEach(function(grupo,gi){ grupo.forEach(function(u){ st[slotsOrd[gi]].push(u.id); }); });
+    semillas.push(st);
+  }
+  // --- Soluciones iniciales D: barrido angular alrededor de la base (sectores contiguos) ---
+  const angulo=unidades.map(function(u){ return Math.atan2(u.lat-BASE_LAMPA.lat, u.lon-BASE_LAMPA.lng); });
+  const ordAng=unidades.map(function(u,i){return i;}).sort(function(a,b){return angulo[a]-angulo[b];});
+  const capRef=Math.max.apply(null,slots.map(function(x){return x.meta;}));
+  const tSweep=Date.now();
+  for(let k=kMin;k<=slots.length && Date.now()-tSweep<1200;k++){
+    const objetivo=Math.min(capRef*1.1, Math.max(volTotal/k*1.05, 1));
+    for(let off=0;off<nU;off++){
+      const grupos=[[]]; let acum=0;
+      for(let q=0;q<nU;q++){
+        const id=ordAng[(off+q)%nU]; const u=unidades[id];
+        if(acum>0 && acum+u.vol>objetivo+1e-9){ grupos.push([]); acum=0; }
+        grupos[grupos.length-1].push(id); acum+=u.vol;
+      }
+      if(grupos.length>slots.length) continue;
+      grupos.sort(function(a,b){ return b.reduce(function(x,i){return x+unidades[i].vol;},0)-a.reduce(function(x,i){return x+unidades[i].vol;},0); });
+      const st=slots.map(function(){return [];});
+      grupos.forEach(function(g,gi){ st[slotsOrd[gi]]=g.slice(); });
+      semillas.push(st);
+    }
+  }
+  let mejorSt=null,mejorC=Infinity;
+  semillas.forEach(function(st){ const s2=mejorar(clonar(st)); const c=total(s2); if(c<mejorC){mejorC=c;mejorSt=s2;} });
+
+  // --- Búsqueda iterada: destruir parcialmente y reconstruir, aceptando solo mejoras ---
+  const rnd=_rng(20260101); let iters=0;
+  while(Date.now()-t0<OPT_PRESUPUESTO_MS && iters<400){
+    iters++;
+    const cand=clonar(mejorSt);
+    const ocupados=cand.map(function(ids,i){return ids.length?i:-1;}).filter(function(i){return i>=0;});
+    const nDestruir=1+Math.floor(rnd()*2);
+    const quitar=[];
+    for(let k=0;k<nDestruir && ocupados.length;k++){
+      const sel=ocupados.splice(Math.floor(rnd()*ocupados.length),1)[0];
+      // saca una parte (o todo) de ese camión
+      const ids=cand[sel]; const frac=rnd()<0.5?1:0.5;
+      const cuantos=Math.max(1,Math.round(ids.length*frac));
+      for(let q=0;q<cuantos;q++){ const j=Math.floor(rnd()*ids.length); quitar.push(ids.splice(j,1)[0]); }
+    }
+    quitar.sort(function(){return rnd()-0.5;});
+    quitar.forEach(function(id){
+      let bb=0,bd=Infinity;
+      for(let b=0;b<cand.length;b++){ const d=costoSlot(b,cand[b].concat([id]))-costoSlot(b,cand[b]); if(d<bd){bd=d;bb=b;} }
+      cand[bb].push(id);
+    });
+    mejorar(cand);
+    const c=total(cand);
+    if(c<mejorC-1e-6){ mejorC=c; mejorSt=cand; }
+  }
+
+  if(process.env.OPT_DEBUG){ mejorSt.forEach(function(ids,si){ if(ids.length) console.log('SLOT',si,slots[si].camion.patente,'v'+slots[si].vuelta,'cost',costoSlot(si,ids).toFixed(1),ids.map(function(i){return unidades[i].stops[0].comuna.slice(0,6);}).join(','));}); console.log('slots',slots.length,'mejorC',mejorC,'inicial',costoInicial); }
+  // --- Validación: nada sobre el 100% y todo pedido sigue asignado una sola vez ---
+  for(let si=0;si<mejorSt.length;si++){
+    const vol=mejorSt[si].reduce(function(a,id){return a+unidades[id].vol;},0);
+    if(vol>slots[si].cap+1e-9) return null;
+  }
+  const nAsignados=mejorSt.reduce(function(a,ids){return a+ids.length;},0);
+  if(nAsignados!==unidades.length) return null;
+  if(mejorC>costoInicial-1e-6 && costoInicial<1000) { /* nada mejor que lo original */ return {sinCambios:true,costoAntes:costoInicial,costoDespues:costoInicial,iteraciones:iters}; }
+
+  // --- Reconstrucción de las rutas ---
+  const nuevas=[];
+  mejorSt.forEach(function(ids,si){
+    if(!ids.length) return;
+    const stops=[]; ids.forEach(function(id){ unidades[id].stops.forEach(function(s){stops.push(s);}); });
+    const sl=slots[si];
+    const zonaReal=calcularEtiquetaPorContenido(stops)||'Ruta';
+    const cont={}; stops.forEach(function(s){const z=zonaOperativaDeStop(s)||'?'; cont[z]=(cont[z]||0)+1;});
+    const padre=Object.keys(cont).sort(function(a,b){return cont[b]-cont[a];})[0];
+    const cor=corredorOperativoDeStop(stops[0])||'';
+    const r={zona:zonaReal,zonaCodigo:padre,corredorCodigo:cor,corredorLabel:zonaReal,stops:stops,volumen:0,volumenRetiro:0,
+      patente:sl.camion.patente,meta:sl.camion.meta,mts3:sl.camion.mts3,transportista:sl.camion.transportista,estado:'OK - Dentro de meta',
+      vueltaNumero:sl.vuelta,tipoVuelta:sl.vuelta===2?'SEGUNDA VUELTA':'PRIMERA VUELTA',
+      stopsOrdenados:[],distTotalKm:0,_routeEngine:'Optimizador geográfico global (reubicación + intercambio + orden con retiros al final)'};
+    recalcularRuta(r);
+    nuevas.push(r);
+  });
+  // Ordena por camión/vuelta; un camión con una sola vuelta activa la lleva como 1ª
+  const porPat={}; nuevas.forEach(function(r){(porPat[r.patente]||(porPat[r.patente]=[])).push(r);});
+  Object.keys(porPat).forEach(function(p){ const rs=porPat[p].sort(function(a,b){return a.vueltaNumero-b.vueltaNumero;}); rs.forEach(function(r,i){ r.vueltaNumero=i+1; r.tipoVuelta=i===1?'SEGUNDA VUELTA':'PRIMERA VUELTA'; }); });
+
+  const cambios=[];
+  nuevas.forEach(function(r){
+    const et=r.patente+' V'+r.vueltaNumero;
+    r.stops.forEach(function(s){ const o=origenDe[norm(s.pedido)]; if(o!==et) cambios.push({pedido:s.pedido,desde:o,hacia:et}); });
+  });
+  return {rutasNuevas:nuevas,reemplaza:rutasRM,cambios:cambios,costoAntes:costoInicial,costoDespues:mejorC,iteraciones:iters,camionesUsados:Object.keys(porPat).length,rutasUsadas:nuevas.length};
+}
+
 async function planificar(pedidosRaw, fleetDisponible, onGeoProgress){
   (pedidosRaw||[]).forEach(normalizarVolumenLinea);
   const stopsAll=consolidar(pedidosRaw);
@@ -1380,7 +1714,7 @@ async function planificar(pedidosRaw, fleetDisponible, onGeoProgress){
       const f=g.camion;
       let estado='OK - Dentro de meta';
       if(volumen>f.mts3+1e-9) estado='SOBRECARGA — REVISAR CAPACIDAD';
-      else if(volumen>f.meta+1e-9) estado='SOBRE META 65% — ASIGNADO';
+      else if(volumen>f.meta+1e-9) estado='SOBRE META 70% — ASIGNADO';
       rutas.push({zona:zonaReal,zonaCodigo:padre,corredorCodigo:corredor,corredorLabel:zonaReal,stops:g.stops,volumen,volumenRetiro,
         patente:f.patente,meta:f.meta,mts3:f.mts3,transportista:f.transportista,estado,
         vueltaNumero:g.vueltaNumero||1, tipoVuelta:g.tipoVuelta||((g.vueltaNumero||1)===2?'SEGUNDA VUELTA':'PRIMERA VUELTA'),
@@ -1396,6 +1730,19 @@ async function planificar(pedidosRaw, fleetDisponible, onGeoProgress){
     rebalancearExcedentesCorredor(grupoRutas);
   });
   rutas.forEach(function(r){ if(r.patente) recalcularRuta(r); });
+
+  /* Optimización geográfica global (ver optimizarGlobalRutas). Si falla o no
+     encuentra nada mejor, las rutas quedan exactamente como estaban. */
+  let optimizacionGlobal=null;
+  try{
+    const og=optimizarGlobalRutas(rutas, fleetDisponible);
+    if(og && og.rutasNuevas){
+      const quitar=new Set(og.reemplaza);
+      for(let i=rutas.length-1;i>=0;i--){ if(quitar.has(rutas[i])) rutas.splice(i,1); }
+      og.rutasNuevas.forEach(function(r){ rutas.push(r); });
+      optimizacionGlobal={aplicada:true,cambios:og.cambios,costoAntes:og.costoAntes,costoDespues:og.costoDespues,iteraciones:og.iteraciones,camionesUsados:og.camionesUsados,rutasUsadas:og.rutasUsadas};
+    } else if(og){ optimizacionGlobal={aplicada:false,cambios:[],costoAntes:og.costoAntes,costoDespues:og.costoDespues,iteraciones:og.iteraciones}; }
+  }catch(e){ console.error('optimizarGlobalRutas falló, se conservan las rutas originales:',e); }
 
   // Fuera de RM queda aislado y no compite por la flota local.
   if(paraOtraRegion.length){
@@ -1481,13 +1828,13 @@ async function planificar(pedidosRaw, fleetDisponible, onGeoProgress){
     }
   }
 
-  return {rutas:rutasFinales,imposibles:imposibles,sinClasificar:sinClasificar,paraOtraRegion:paraOtraRegion,excluidosMas13:excluidosMas13,sinCamion:sinCamion,fusionesSector:fusionesRealizadas,direccionesInconsistentes:direccionesInconsistentes};
+  return {rutas:rutasFinales,imposibles:imposibles,sinClasificar:sinClasificar,paraOtraRegion:paraOtraRegion,excluidosMas13:excluidosMas13,sinCamion:sinCamion,fusionesSector:fusionesRealizadas,optimizacionGlobal:optimizacionGlobal,direccionesInconsistentes:direccionesInconsistentes};
 }
 
 function calcularEstadoRuta(r){
   if(!r.patente) return 'Sin patente asignada';
   if(r.volumen > r.mts3) return 'SUPERA CAPACIDAD MAXIMA';
-  if(r.volumen > r.meta) return 'SUPERA META 65%';
+  if(r.volumen > r.meta) return 'SUPERA META 70%';
   return 'OK - Dentro de meta';
 }
 
@@ -1596,4 +1943,5 @@ module.exports = {
   DEPOT,
   estadoUsoMapbox: mapbox.estadoUso,
   estadoOSRM: osrm.estado,
+  _interno: { consolidar, nearestNeighborDesdeLampa, distanciaRutaNN, _cruces, zonaOperativaDeStop, corredorOperativoDeStop, volCarga, coordStop, calcularDistanciaKm, BASE_LAMPA, claveDireccionStop, normalizarVolumenLinea },
 };
