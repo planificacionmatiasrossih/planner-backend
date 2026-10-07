@@ -86,7 +86,7 @@ const FLEET = [
 /* Regla operacional vigente: la meta de cada camión es el 70% de su capacidad física
    (referencia, no tope absoluto; el tope duro sigue siendo el 100%). */
 const META_OPERACIONAL_PCT = 0.70;
-FLEET.forEach(function(f){ f.meta = Math.round(f.mts3*META_OPERACIONAL_PCT*10)/10; });
+FLEET.forEach(function(f){ if(f.transportista==='TRANSPORTES A Y J') return; /* A y J: meta fija 22 m3 (definida por operación) */ f.meta = Math.round(f.mts3*META_OPERACIONAL_PCT*10)/10; });
 
 const DEPOT = { nombre: "Av. La Siembra Poniente 3404, Lampa", lon: -70.6865, lat: -33.2845 };
 
@@ -171,7 +171,7 @@ const MACRO_COLOR_HEX = {A:"#7C93B8", B:"#8FA888", C:"#B8916F", D:"#8F7CA6"};
 
 const PERIFERICO_SUR = new Set([
   "PADRE HURTADO","PENAFLOR","TALAGANTE","EL MONTE","MELIPILLA","CURACAVI",
-  "ISLA DE MAIPO","BUIN","PAINE","CALERA DE TANGO","PIRQUE","MARIA PINTO","SAN JOSE DE MAIPO","ALHUE"
+  "ISLA DE MAIPO","BUIN","PAINE","CALERA DE TANGO","MARIA PINTO","ALHUE"
 ]);
 
 const CORREDORES = {
@@ -180,7 +180,7 @@ const CORREDORES = {
   B_PONIENTE:new Set(["PUDAHUEL","CERRO NAVIA","LO PRADO","QUINTA NORMAL","MAIPU","ESTACION CENTRAL","CERRILLOS"]),
   B_CENTRO:new Set(["SANTIAGO","SANTIAGO CENTRO","PEDRO AGUIRRE CERDA","LO ESPEJO","INDEPENDENCIA","RECOLETA","CONCHALI"]),
   C_SUR:new Set(["SAN JOAQUIN","SAN BERNARDO","LA CISTERNA","SAN MIGUEL","SAN RAMON","LA GRANJA","EL BOSQUE","LA PINTANA"]),
-  C_ORIENTE:new Set(["MACUL","PENALOLEN","LA REINA","LA FLORIDA","PUENTE ALTO"]),
+  C_ORIENTE:new Set(["MACUL","PENALOLEN","LA REINA","LA FLORIDA","PUENTE ALTO","PIRQUE","SAN JOSE DE MAIPO"]),
   D_PERIFERICO:PERIFERICO_SUR
 };
 
@@ -1206,10 +1206,13 @@ function recalcularRuta(r){
         solo una referencia (penalización suave por pasarse, ninguna por
         quedar debajo: la geografía gana sobre el llenado).
    ====================================================================== */
-const OPT_FIJO_POR_RUTA_KM = 12;      // costo equivalente de sacar una vuelta más
-const OPT_PENAL_SOBRE_META_KM_M3 = 4; // km-equivalentes por m³ sobre el 70%
+const OPT_FIJO_POR_RUTA_KM = 22;      // costo equivalente de sacar una vuelta más
+const OPT_PENAL_SOBRE_META_KM_M3 = 3; // km-equivalentes por m³ sobre el 70%
 const OPT_PENAL_CRUCE_KM = 15;        // por cada cruce de la ruta consigo misma
 const OPT_PENAL_MACRO_KM = 20;        // por cada macro-sector extra mezclado
+const OPT_PENAL_SEGUNDA_VUELTA_KM = 30; // una 2ª vuelta cuesta más que usar una patente elegida que está libre
+const OPT_PENAL_CORREDOR_KM = 25;     // por cada corredor extra mezclado en una misma ruta
+const OPT_PENAL_DISPERSION_KM = 1.2;  // por km de distancia media de las paradas al centro de la ruta (compacidad)
 const OPT_DIAMETRO_LIBRE_KM = 22;     // una ruta compacta no pasa de ~18 km entre sus puntos más lejanos
 const OPT_PENAL_DIAMETRO_KM = 5.0;    // km-equivalentes por cada km de más
 const OPT_PRESUPUESTO_MS = 4000;
@@ -1251,7 +1254,7 @@ function optimizarGlobalRutas(rutas, fleetDisponible){
   // --- Espacios disponibles (camión × vuelta). Se usan primero los camiones ya asignados. ---
   const usados=[]; rutasRM.forEach(function(r){ if(r.patente && usados.indexOf(r.patente)<0) usados.push(r.patente); });
   const camiones=[]; usados.forEach(function(p){ const f=fleetDisponible.find(function(x){return x.patente===p;}); if(f) camiones.push(f); });
-  fleetDisponible.forEach(function(f){ if(camiones.length<usados.length+1 && camiones.indexOf(f)<0) camiones.push(f); });
+  fleetDisponible.slice().sort(function(a,b){return b.mts3-a.mts3;}).forEach(function(f){ if(camiones.length<Math.min(12,fleetDisponible.length) && camiones.indexOf(f)<0) camiones.push(f); });
   const slots=[];
   camiones.forEach(function(f){ for(let v=1; v<=MAX_VUELTAS_POR_CAMION; v++) slots.push({camion:f,vuelta:v,cap:f.mts3,meta:f.meta}); });
   const maxCap=Math.max.apply(null,slots.map(function(s){return s.cap;}));
@@ -1259,7 +1262,7 @@ function optimizarGlobalRutas(rutas, fleetDisponible){
 
   // Matrices de distancia entre bloques (una sola vez) para evaluar rutas rápido.
   const nU=unidades.length;
-  unidades.forEach(function(u){ const c=coordStop(u.stops[0])||{lat:BASE_LAMPA.lat,lon:BASE_LAMPA.lng}; u.lat=c.lat; u.lon=c.lon; u.macro=zonaOperativaDeStop(u.stops[0])||'?'; });
+  unidades.forEach(function(u){ const c=coordStop(u.stops[0])||{lat:BASE_LAMPA.lat,lon:BASE_LAMPA.lng}; u.lat=c.lat; u.lon=c.lon; u.macro=zonaOperativaDeStop(u.stops[0])||'?'; u.corr=corredorOperativoDeStop(u.stops[0])||'?'; });
   const dep=unidades.map(function(u){return calcularDistanciaKm({lat:BASE_LAMPA.lat,lng:BASE_LAMPA.lng},{lat:u.lat,lng:u.lon});});
   const DM=unidades.map(function(a){return unidades.map(function(b){return calcularDistanciaKm({lat:a.lat,lng:a.lon},{lat:b.lat,lng:b.lon});});});
   function ordenRapido(ids){
@@ -1288,10 +1291,16 @@ function optimizarGlobalRutas(rutas, fleetDisponible){
     const orr=ordenRapido(ids);
     let c=orr.km+OPT_FIJO_POR_RUTA_KM+OPT_PENAL_CRUCE_KM*crucesIds(orr.ord);
     const sl=slots[si];
+    if(sl.vuelta>=2) c+=OPT_PENAL_SEGUNDA_VUELTA_KM; // se prefiere usar otra patente elegida antes que hacer una 2ª vuelta
     if(vol>sl.cap+1e-9) c+=1000+1000*(vol-sl.cap);
     else if(vol>sl.meta+1e-9) c+=OPT_PENAL_SOBRE_META_KM_M3*(vol-sl.meta);
     const macros=new Set(ids.map(function(id){return unidades[id].macro;})).size;
     c+=OPT_PENAL_MACRO_KM*(macros-1);
+    const corrs=new Set(ids.map(function(id){return unidades[id].corr;})).size;
+    c+=OPT_PENAL_CORREDOR_KM*(corrs-1);
+    if(ids.length>1){ let cl=0,cn=0; ids.forEach(function(id){cl+=unidades[id].lat;cn+=unidades[id].lon;}); cl/=ids.length; cn/=ids.length;
+      let disp=0; ids.forEach(function(id){ disp+=calcularDistanciaKm({lat:cl,lng:cn},{lat:unidades[id].lat,lng:unidades[id].lon}); });
+      c+=OPT_PENAL_DISPERSION_KM*disp; }
     let diam=0; for(let i=0;i<ids.length;i++) for(let j=i+1;j<ids.length;j++){ if(DM[ids[i]][ids[j]]>diam) diam=DM[ids[i]][ids[j]]; }
     if(diam>OPT_DIAMETRO_LIBRE_KM) c+=OPT_PENAL_DIAMETRO_KM*(diam-OPT_DIAMETRO_LIBRE_KM);
     cache.set(key,c); return c;
@@ -1324,6 +1333,12 @@ function optimizarGlobalRutas(rutas, fleetDisponible){
           const d=costoSlot(a,na)+costoSlot(b,nb)-costoSlot(a,st[a])-costoSlot(b,st[b]);
           if(d<-1e-6){ st[a]=na; st[b]=nb; mejora=true; }
         }
+      }
+      // fusionar dos rutas completas en una sola (útil cuando quedan viajes chicos del mismo sector)
+      for(let a=0;a<st.length;a++) for(let b=0;b<st.length;b++){
+        if(a===b||!st[a].length||!st[b].length) continue;
+        const un=st[b].concat(st[a]);
+        if(costoSlot(b,un)<costoSlot(a,st[a])+costoSlot(b,st[b])-1e-6){ st[b]=un; st[a]=[]; mejora=true; }
       }
       // cerrar una ruta repartiendo sus bloques en las demás
       for(let a=0;a<st.length;a++){
@@ -1896,10 +1911,16 @@ async function planificar(pedidosRaw, fleetDisponible, onGeoProgress){
   });
   Object.keys(porPatenteVueltas).forEach(function(pat){
     const rs=porPatenteVueltas[pat];
-    if(rs.length===1 && (rs[0].vueltaNumero||1)!==1){
-      rs[0].vueltaNumero=1;
-      rs[0].tipoVuelta='PRIMERA VUELTA';
-    }
+    // Renumeración defensiva: nunca dos rutas del mismo camión con el mismo número de vuelta
+    rs.sort(function(a,b){return (a.vueltaNumero||1)-(b.vueltaNumero||1);});
+    rs.forEach(function(r,i){ r.vueltaNumero=i+1; r.tipoVuelta=i===0?'PRIMERA VUELTA':(i===1?'SEGUNDA VUELTA':('VUELTA '+(i+1))); });
+  });
+
+  // Alerta de ruta dispersa: una ruta que mezcla 3 o más corredores recorre media ciudad
+  rutasFinales.forEach(function(r){
+    if(!r.patente || !r.stops) return;
+    const cs=new Set(); r.stops.forEach(function(s){ const c=corredorOperativoDeStop(s); if(c) cs.add(c); });
+    if(cs.size>=3){ r.rutaDispersa=true; r.motivoDispersa='Mezcla '+cs.size+' sectores ('+Array.from(cs).map(function(c){return CORREDOR_LABEL[c]||c;}).join(', ')+'). Conviene revisar o sumar un camión.'; }
   });
 
   /* Afinado final de distancia/tiempo con Mapbox: el ORDEN de las paradas
