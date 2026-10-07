@@ -1224,6 +1224,9 @@ const OPT_PENAL_SOBRE_META_KM_M3 = 3; // km-equivalentes por m³ sobre el 70%
 const OPT_PENAL_CRUCE_KM = 15;        // por cada cruce de la ruta consigo misma
 const OPT_PENAL_MACRO_KM = 20;        // por cada macro-sector extra mezclado
 const OPT_PENAL_SEGUNDA_VUELTA_KM = 30; // una 2ª vuelta cuesta más que usar una patente elegida que está libre
+const OPT_PENAL_PERIFERICO_MEZCLA_KM = 120; // zonas lejanas (Peñaflor, Talagante, Melipilla…) no se mezclan con el resto: viaje propio o 2ª vuelta
+const OPT_MAX_MIN_RUTA = 540;          // tope blando de 9 h por viaje (conducción a 22 km/h + 12 min por parada)
+const OPT_PENAL_MIN_EXTRA_KM = 0.6;    // km-equivalentes por minuto sobre el tope
 const OPT_PENAL_CORREDOR_KM = 25;     // por cada corredor extra mezclado en una misma ruta
 const OPT_PENAL_DISPERSION_KM = 1.2;  // por km de distancia media de las paradas al centro de la ruta (compacidad)
 const OPT_DIAMETRO_LIBRE_KM = 22;     // una ruta compacta no pasa de ~18 km entre sus puntos más lejanos
@@ -1310,6 +1313,11 @@ function optimizarGlobalRutas(rutas, fleetDisponible){
     const macros=new Set(ids.map(function(id){return unidades[id].macro;})).size;
     c+=OPT_PENAL_MACRO_KM*(macros-1);
     const corrs=new Set(ids.map(function(id){return unidades[id].corr;})).size;
+    const nPeri=ids.filter(function(id){return unidades[id].corr==='D_PERIFERICO';}).length;
+    if(nPeri>0 && nPeri<ids.length) c+=OPT_PENAL_PERIFERICO_MEZCLA_KM;
+    let nParadas=0; ids.forEach(function(id){ nParadas+=unidades[id].stops.length; });
+    const minEst=(orr.km/22)*60+nParadas*12;
+    if(minEst>OPT_MAX_MIN_RUTA) c+=OPT_PENAL_MIN_EXTRA_KM*(minEst-OPT_MAX_MIN_RUTA);
     c+=OPT_PENAL_CORREDOR_KM*(corrs-1);
     if(ids.length>1){ let cl=0,cn=0; ids.forEach(function(id){cl+=unidades[id].lat;cn+=unidades[id].lon;}); cl/=ids.length; cn/=ids.length;
       let disp=0; ids.forEach(function(id){ disp+=calcularDistanciaKm({lat:cl,lng:cn},{lat:unidades[id].lat,lng:unidades[id].lon}); });
