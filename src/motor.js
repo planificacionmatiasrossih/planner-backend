@@ -326,6 +326,15 @@ function norm(s){
   return (s||"").toString().normalize("NFD").replace(/[\u0300-\u036f]/g,"").toUpperCase().trim();
 }
 
+function _distEdicion(a,b){ const m=a.length,n=b.length; const d=[]; for(let i=0;i<=m;i++){d[i]=[i];} for(let j=1;j<=n;j++) d[0][j]=j;
+  for(let i=1;i<=m;i++) for(let j=1;j<=n;j++) d[i][j]=Math.min(d[i-1][j]+1,d[i][j-1]+1,d[i-1][j-1]+(a[i-1]===b[j-1]?0:1)); return d[m][n]; }
+function sugerirComunaParecida(texto){
+  const t=norm(texto||''); if(!t||t.length<4) return '';
+  let mejor='',md=99;
+  Object.keys(COMUNAS).forEach(function(c){ const d=_distEdicion(t,norm(c)); if(d<md){md=d;mejor=c;} });
+  return md<=2 ? mejor : '';
+}
+
 function haversine(lon1,lat1,lon2,lat2){
   const R=6371;
   const p1=lat1*Math.PI/180, p2=lat2*Math.PI/180;
@@ -346,7 +355,11 @@ function coordFallbackComuna(s){
 }
 
 function coordStop(s){
-  if(s && Number.isFinite(Number(s.lat)) && Number.isFinite(Number(s.lon))) return {lat:Number(s.lat),lon:Number(s.lon),exact:s._geoExact===true,source:s._geoExact?'direccion':'comuna'};
+  /* Coordenada válida solo si existe de verdad (null/''/undefined NO valen 0,0) y cae en la zona central de Chile. */
+  if(s && s.lat!==null && s.lat!==undefined && s.lat!=='' && s.lon!==null && s.lon!==undefined && s.lon!=='' && Number.isFinite(Number(s.lat)) && Number.isFinite(Number(s.lon))){
+    const la=Number(s.lat), lo=Number(s.lon);
+    if(la>-35.5 && la<-32.0 && lo>-72.6 && lo<-69.0) return {lat:la,lon:lo,exact:s._geoExact===true,source:s._geoExact?'direccion':'comuna'};
+  }
   return coordFallbackComuna(s);
 }
 
@@ -1859,8 +1872,8 @@ async function planificar(pedidosRaw, fleetDisponible, onGeoProgress){
   if(sinComunaRev.length){
     rutas.push(_rutaRevision(sinComunaRev,'⚠ REVISAR — comuna no reconocida','⚠ REVISAR — comuna no reconocida: corrige la comuna/dirección','Comuna no reconocida ("'+'" ): corregir comuna o dirección y volver a optimizar'));
     const r=rutas[rutas.length-1];
-    r.stops.forEach(function(s){ s._alertaRevision='Comuna no reconocida ("'+(s.comuna||'sin comuna')+'"): corregir comuna o dirección y volver a optimizar'; });
-    r.stopsOrdenados.forEach(function(s){ s._alertaRevision='Comuna no reconocida ("'+(s.comuna||'sin comuna')+'"): corregir comuna o dirección y volver a optimizar'; });
+    r.stops.forEach(function(s){ const sg=sugerirComunaParecida(s.comuna); s._comunaSugerida=sg||s._comunaSugerida; s._alertaRevision='Comuna no reconocida ("'+(s.comuna||'sin comuna')+'")'+(sg?' — ¿será '+sg+'?':'')+': corrige comuna o dirección y vuelve a optimizar'; });
+    r.stopsOrdenados.forEach(function(s){ const sg=sugerirComunaParecida(s.comuna); s._alertaRevision='Comuna no reconocida ("'+(s.comuna||'sin comuna')+'")'+(sg?' — ¿será '+sg+'?':'')+': corrige comuna o dirección y vuelve a optimizar'; });
   }
 
   // Fuera de RM queda aislado y no compite por la flota local.
