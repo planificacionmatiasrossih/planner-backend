@@ -1255,7 +1255,7 @@ function optimizarGlobalRutas(rutas, fleetDisponible){
   if(!rutasRM.length || !fleetDisponible || !fleetDisponible.length) return null;
 
   // --- Bloques indivisibles: mismo pedido = 1 parada; misma dirección = 1 bloque ---
-  const unidades=[]; const porClave=new Map();
+  let unidades=[]; const porClave=new Map();
   const origenDe={}; // pedido -> etiqueta de ruta original
   rutasRM.forEach(function(r){
     const et=(r.patente||'SIN CAMIÓN')+' V'+(r.vueltaNumero||1);
@@ -1274,7 +1274,12 @@ function optimizarGlobalRutas(rutas, fleetDisponible){
   const slots=[];
   camiones.forEach(function(f){ for(let v=1; v<=MAX_VUELTAS_POR_CAMION; v++) slots.push({camion:f,vuelta:v,cap:f.mts3,meta:f.meta}); });
   const maxCap=Math.max.apply(null,slots.map(function(s){return s.cap;}));
-  if(unidades.some(function(u){return u.vol>maxCap+1e-9;})) return null;
+  /* Un bloque que por sí solo supera la capacidad de cualquier camión elegido
+     (p.ej. un pedido de 45 m³) no se puede "optimizar": se saca del cálculo y,
+     al final, se carga en la ruta de su sector (aunque la deje sobrecargada). */
+  const grandes=unidades.filter(function(u){return u.vol>maxCap+1e-9;});
+  if(grandes.length){ unidades=unidades.filter(function(u){return u.vol<=maxCap+1e-9;}); unidades.forEach(function(u,i){u.id=i;}); grandes.forEach(function(g){g.id=-1;}); }
+  if(!unidades.length) return null;
 
   // Matrices de distancia entre bloques (una sola vez) para evaluar rutas rápido.
   const nU=unidades.length;
@@ -1385,7 +1390,7 @@ function optimizarGlobalRutas(rutas, fleetDisponible){
     if(si<0) si=slots.findIndex(function(s,i){return !ocup.has(i);});
     if(si<0) si=0;
     ocup.add(si);
-    const ids=new Set(); r.stops.forEach(function(s){ ids.add(porClave.get(claveDireccionStop(s)).id); });
+    const ids=new Set(); r.stops.forEach(function(s){ { const pu=porClave.get(claveDireccionStop(s)); if(pu.id>=0) ids.add(pu.id); } });
     ids.forEach(function(id){ stA[si].push(id); });
   });
   // evitar duplicados si una ruta cayó en un slot ya usado
@@ -1491,6 +1496,21 @@ function optimizarGlobalRutas(rutas, fleetDisponible){
       stopsOrdenados:[],distTotalKm:0,_routeEngine:'Optimizador geográfico global (reubicación + intercambio + orden con retiros al final)'};
     recalcularRuta(r);
     nuevas.push(r);
+  });
+  // Bloques demasiado grandes para cualquier camión: se cargan en la ruta más cercana de su sector
+  grandes.forEach(function(g){
+    if(!nuevas.length) return;
+    const c=coordStop(g.stops[0])||{lat:BASE_LAMPA.lat,lon:BASE_LAMPA.lng}; const cor=corredorOperativoDeStop(g.stops[0]);
+    let mejor=null,md=Infinity;
+    nuevas.forEach(function(r){
+      let la=0,lo=0,n=0; r.stops.forEach(function(s){ const cc=coordStop(s); if(cc){la+=cc.lat;lo+=cc.lon;n++;} });
+      const ce=n?{lat:la/n,lon:lo/n}:{lat:BASE_LAMPA.lat,lon:BASE_LAMPA.lng};
+      let d=calcularDistanciaKm({lat:c.lat,lng:c.lon},{lat:ce.lat,lng:ce.lon});
+      if(cor && r.stops.some(function(x){return corredorOperativoDeStop(x)===cor;})) d-=15;
+      if(d<md){md=d;mejor=r;}
+    });
+    g.stops.forEach(function(s){ mejor.stops.push(s); });
+    recalcularRuta(mejor);
   });
   // Ordena por camión/vuelta; un camión con una sola vuelta activa la lleva como 1ª
   const porPat={}; nuevas.forEach(function(r){(porPat[r.patente]||(porPat[r.patente]=[])).push(r);});
@@ -1619,7 +1639,8 @@ async function planificar(pedidosRaw, fleetDisponible, onGeoProgress){
   /* Regla dura: >13 m³ nunca entra al ruteo urbano.
      La version anterior usaba <=15 aqui, contradiciendo la regla de >13 m³
      y permitiendo que pedidos de 13-15 m³ terminaran en una ruta normal. */
-  const stopsOperables=stopsAll.filter(function(s){return Number(s.volumen)<=13+1e-9;});
+  excluidosMas13.forEach(function(s){ s._alertaRevision='Supera 13 m³ ('+(Number(s.volumen)||0).toFixed(1)+' m³): se cargó en la ruta de su sector, revisar transporte y dirección'; });
+  const stopsOperables=stopsAll.slice(); /* los >13 m³ se rutean igual (con advertencia), nunca quedan fuera */
   const paraOtraRegion=stopsOperables.filter(function(s){return s.esOtraRegion;});
   const stopsRM=stopsOperables.filter(function(s){return !s.esOtraRegion;});
   const sinClasificar=stopsRM.filter(function(s){return !s._comunaInfo;});
@@ -1856,6 +1877,31 @@ async function planificar(pedidosRaw, fleetDisponible, onGeoProgress){
     } else if(og){ optimizacionGlobal={aplicada:false,cambios:[],costoAntes:og.costoAntes,costoDespues:og.costoDespues,iteraciones:og.iteraciones}; }
   }catch(e){ console.error('optimizarGlobalRutas falló, se conservan las rutas originales:',e); }
 
+  /* Ningún pedido queda sin ruta: si un sector se quedó sin camión o el
+     volumen no cabe, las paradas se cargan IGUAL en la ruta con patente de ese
+     sector (la más parecida), aunque pase la meta o la capacidad: la ruta queda
+     marcada como sobrecargada para que quien despacha decida. */
+  (function absorberRutasSinCamion(){
+    const conPat=rutas.filter(function(r){return r.patente && r.stops && r.stops.length;});
+    if(!conPat.length) return;
+    function centro(r){ let la=0,lo=0,n=0; r.stops.forEach(function(s){ const c=coordStop(s); if(c){la+=c.lat;lo+=c.lon;n++;} }); return n?{lat:la/n,lon:lo/n}:{lat:BASE_LAMPA.lat,lon:BASE_LAMPA.lng}; }
+    rutas.slice().forEach(function(r0){
+      if(r0.patente || r0.requiereRevision || !r0.stops || !r0.stops.length) return;
+      r0.stops.slice().forEach(function(s){
+        const c=coordStop(s)||{lat:BASE_LAMPA.lat,lon:BASE_LAMPA.lng}; const cor=corredorOperativoDeStop(s);
+        let mejor=null,md=Infinity;
+        conPat.forEach(function(r){
+          const ce=centro(r); let d=calcularDistanciaKm({lat:c.lat,lng:c.lon},{lat:ce.lat,lng:ce.lon});
+          if(cor && r.stops.some(function(x){return corredorOperativoDeStop(x)===cor;})) d-=15;
+          if(d<md){md=d;mejor=r;}
+        });
+        mejor.stops.push(s);
+      });
+      const i=rutas.indexOf(r0); if(i>=0) rutas.splice(i,1);
+    });
+    conPat.forEach(function(r){ recalcularRuta(r); });
+  })();
+
   /* Pedidos que las reglas dejan fuera del ruteo normal (más de 13 m³ o con
      comuna que el sistema no reconoce) IGUAL se cargan en el resultado, cada
      uno en una ruta "⚠ REVISAR", sin patente y con una advertencia en la propia
@@ -1872,9 +1918,6 @@ async function planificar(pedidosRaw, fleetDisponible, onGeoProgress){
       patente:null,meta:null,mts3:null,transportista:null,vueltaNumero:1,tipoVuelta:'REVISIÓN MANUAL',
       estado:estado,requiereRevision:true,stopsOrdenados:ord,distTotalKm:distanciaRutaNN(ord),_routeEngine:'Revisión manual'};
   }
-  excluidosMas13.forEach(function(s){
-    rutas.push(_rutaRevision([s],'⚠ REVISAR — supera 13 m³','⚠ REVISAR — supera 13 m³: requiere transporte pesado o varios viajes','Supera 13 m³ ('+(Number(s.volumen)||0).toFixed(1)+' m³): revisar transporte y dirección'));
-  });
   const yaEnRutas=new Set(); rutas.forEach(function(r){(r.stops||[]).forEach(function(s){yaEnRutas.add(norm(s.pedido));});});
   const sinComunaRev=sinClasificar.filter(function(s){return !yaEnRutas.has(norm(s.pedido));});
   if(sinComunaRev.length){
