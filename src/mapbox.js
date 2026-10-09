@@ -56,6 +56,7 @@ function estadoUso() {
     mes: c.mes,
     geocoding: c.geocoding || 0,
     directions: c.directions || 0,
+    matrixElementos: c.matrix || 0,
     limiteSeguro: LIMITE_SEGURO_MENSUAL,
     mapboxActivo: !!TOKEN,
   };
@@ -134,6 +135,37 @@ async function calcularRutaRealMapbox(puntos) {
 }
 
 
+// Matriz de distancias reales por calle entre varios puntos (Mapbox Matrix API).
+// Se usa solo como RESPALDO cuando OSRM (gratis) no responde, para ordenar las
+// paradas de una ruta por calles reales. Máximo 25 puntos por consulta (límite
+// de Mapbox). Se cuenta por "elementos" (n x n) con tope mensual de seguridad.
+const LIMITE_SEGURO_MATRIX_ELEMENTOS = 60000;
+async function obtenerMatrizMapbox(puntos) {
+  if (!TOKEN) return null;
+  if (!Array.isArray(puntos) || puntos.length < 3 || puntos.length > 25) return null;
+  const elementos = puntos.length * puntos.length;
+  const c = leerContador();
+  if ((c.matrix || 0) + elementos > LIMITE_SEGURO_MATRIX_ELEMENTOS) return null;
+  c.matrix = (c.matrix || 0) + elementos;
+  guardarContador(c);
+  try {
+    const coords = puntos.map(p => p.lon.toFixed(6) + ',' + p.lat.toFixed(6)).join(';');
+    const url = 'https://api.mapbox.com/directions-matrix/v1/mapbox/driving/' + coords
+      + '?annotations=distance&access_token=' + TOKEN;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 9000);
+    let resp;
+    try { resp = await fetch(url, { signal: ctrl.signal }); } finally { clearTimeout(timer); }
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    if (!data || data.code !== 'Ok' || !Array.isArray(data.distances)) return null;
+    const ok = data.distances.length === puntos.length && data.distances.every(f => Array.isArray(f) && f.length === puntos.length && f.every(v => Number.isFinite(v)));
+    return ok ? data.distances : null; // metros
+  } catch (e) {
+    return null;
+  }
+}
+
 // Saca los nombres de comuna/localidad de un resultado de Mapbox. En Chile,
 // Mapbox informa la comuna como "place" (a veces "locality"). Se deja fuera
 // "district" porque ahí viene la PROVINCIA (p.ej. "Santiago"), que contiene
@@ -192,4 +224,4 @@ async function candidatosComunaMapbox(direccion) {
   } catch (e) { return null; }
 }
 
-module.exports = { buscarDireccionesMapbox, candidatosComunaMapbox, geocodificarConMapbox, calcularRutaRealMapbox, estadoUso };
+module.exports = { obtenerMatrizMapbox, buscarDireccionesMapbox, candidatosComunaMapbox, geocodificarConMapbox, calcularRutaRealMapbox, estadoUso };

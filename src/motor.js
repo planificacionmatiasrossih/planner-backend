@@ -725,49 +725,75 @@ function calcularDistanciaKm(p1,p2){
   return R*2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));
 }
 
-function optimizarOrden2OptDesdeLampa(orden){
-  if(orden.length<4) return orden;
-  /* Si hay múltiples ventanas horarias, la secuencia temporal tiene prioridad. */
-  if(orden.filter(function(s){return !!s.horario;}).length>=2) return orden;
-  const puntos=[{lat:BASE_LAMPA.lat,lon:BASE_LAMPA.lng}].concat(orden.map(function(s){
-    const c=coordStop(s); return c?{lat:c.lat,lon:c.lon}:null;
-  })).filter(Boolean);
-  if(puntos.length!==orden.length+1) return orden;
-  /* Ambos puntos pueden venir como {lat,lon} (paradas/base): se normalizan a {lat,lng}.
-     (Antes solo se normalizaba el segundo y el 2-opt comparaba NaN, así que casi nunca mejoraba nada.) */
-  function d(a,b){return calcularDistanciaKm({lat:a.lat,lng:(a.lon!==undefined?a.lon:a.lng)},{lat:b.lat,lng:(b.lon!==undefined?b.lon:b.lng)});}
-  let mejor=orden.slice();
-  let mejorDist=0;
-  for(let i=0;i<mejor.length;i++){
-    const a=i===0?puntos[0]:{lat:mejor[i-1].lat,lon:mejor[i-1].lon};
-    const b={lat:mejor[i].lat,lon:mejor[i].lon};
-    mejorDist+=d(a,b);
-  }
-  const ult=mejor[mejor.length-1];
-  mejorDist+=d({lat:ult.lat,lon:ult.lon},puntos[0]);
-  let cambio=true, iter=0;
-  while(cambio && iter<80){
-    cambio=false; iter++;
-    for(let i=0;i<mejor.length-1;i++){
-      for(let k=i+1;k<mejor.length;k++){
-        const A=i===0?puntos[0]:{lat:mejor[i-1].lat,lon:mejor[i-1].lon};
-        const B={lat:mejor[i].lat,lon:mejor[i].lon};
-        const C={lat:mejor[k].lat,lon:mejor[k].lon};
-        const D=k===mejor.length-1?puntos[0]:{lat:mejor[k+1].lat,lon:mejor[k+1].lon};
-        const actual=d(A,B)+d(C,D);
-        const propuesta=d(A,C)+d(B,D);
-        if(propuesta+1e-6<actual){
-          const invertida=mejor.slice(i,k+1).reverse();
-          mejor.splice.apply(mejor,[i,k-i+1].concat(invertida));
-          cambio=true;
+/* Mejora de una secuencia de visita con una matriz de distancias (índice 0 = depósito).
+   Recorrido cerrado: depósito -> paradas -> depósito. Aplica 2-opt (elimina cruces / zig-zag)
+   y Or-opt (mueve 1-3 paradas seguidas, en ambos sentidos, a un lugar mejor) hasta que ya
+   no se pueda mejorar. Sirve igual con km en línea recta, OSRM o Mapbox. */
+/* cola = paradas que SIEMPRE van al final (retiros sueltos). Se recorren en el orden "la más
+   cercana primero" desde la última entrega, y el recorrido cierra en el depósito. */
+function ordenarColaMatriz(ultimo, cola, M){
+  const pend=(cola||[]).slice(), orden=[]; let act=ultimo;
+  while(pend.length){ let bi=0,bd=Infinity; pend.forEach(function(q,k){ if(M[act][q]<bd){ bd=M[act][q]; bi=k; } }); const q=pend.splice(bi,1)[0]; orden.push(q); act=q; }
+  return orden;
+}
+function costoSecuenciaMatriz(seq, M, cola){
+  let t=M[0][seq[0]];
+  for(let i=0;i<seq.length-1;i++) t+=M[seq[i]][seq[i+1]];
+  let act=seq[seq.length-1];
+  if(cola && cola.length){ ordenarColaMatriz(act,cola,M).forEach(function(q){ t+=M[act][q]; act=q; }); }
+  return t+M[act][0];
+}
+function mejorarSecuenciaMatriz(seqInicial, M, cola){
+  let best=seqInicial.slice();
+  if(best.length<3) return best;
+  let bc=costoSecuenciaMatriz(best,M,cola);
+  let mejoro=true, it=0;
+  while(mejoro && it<60){
+    mejoro=false; it++;
+    // 2-opt
+    for(let i=0;i<best.length-1;i++){
+      for(let k=i+1;k<best.length;k++){
+        const cand=best.slice(0,i).concat(best.slice(i,k+1).reverse(),best.slice(k+1));
+        const c=costoSecuenciaMatriz(cand,M,cola);
+        if(c+1e-9<bc){ best=cand; bc=c; mejoro=true; }
+      }
+    }
+    // Or-opt (segmentos de 1 a 3 paradas)
+    for(let len=1;len<=3;len++){
+      for(let i=0;i+len<=best.length;i++){
+        const seg=best.slice(i,i+len);
+        const resto=best.slice(0,i).concat(best.slice(i+len));
+        if(!resto.length) continue;
+        for(let j=0;j<=resto.length;j++){
+          if(j===i) continue; // misma posición
+          for(const sg of [seg,seg.slice().reverse()]){
+            const cand=resto.slice(0,j).concat(sg,resto.slice(j));
+            const c=costoSecuenciaMatriz(cand,M,cola);
+            if(c+1e-9<bc){ best=cand; bc=c; mejoro=true; }
+          }
         }
       }
     }
   }
-  return mejor;
+  return best;
+}
+function optimizarOrden2OptDesdeLampa(orden, colaStops){
+  if(orden.length<4) return orden;
+  /* Si hay múltiples ventanas horarias, la secuencia temporal tiene prioridad. */
+  if(orden.filter(function(s){return !!s.horario;}).length>=2) return orden;
+  const cola=(colaStops||[]).filter(function(s){ return !!coordStop(s); });
+  const pts=[{lat:BASE_LAMPA.lat,lng:BASE_LAMPA.lng}].concat(orden.map(function(s){
+    const c=coordStop(s); return c?{lat:c.lat,lng:c.lon}:null;
+  }),cola.map(function(s){ const c=coordStop(s); return {lat:c.lat,lng:c.lon}; }));
+  if(pts.some(function(q){return !q;})) return orden;
+  const n=pts.length;
+  const M=[]; for(let i=0;i<n;i++){ M.push([]); for(let j=0;j<n;j++) M[i].push(i===j?0:calcularDistanciaKm(pts[i],pts[j])); }
+  const colaIdx=cola.map(function(_,i){return orden.length+1+i;});
+  const seq=mejorarSecuenciaMatriz(orden.map(function(_,i){return i+1;}),M,colaIdx);
+  return seq.map(function(i){return orden[i-1];});
 }
 
-function nearestNeighborBase(stops){
+function nearestNeighborBase(stops, colaStops){
   const pts=stops.map(function(s){
     const c=coordStop(s);
     return Object.assign({},s,c?{lat:c.lat,lon:c.lon}:{lat:null,lon:null});
@@ -795,7 +821,7 @@ function nearestNeighborBase(stops){
     orden.push(Object.assign({},next,{distTramoKm:Math.round(bestDist*10)/10}));
     actual={lat:next.lat,lng:next.lon};
   }
-  const optimizada=optimizarOrden2OptDesdeLampa(orden);
+  const optimizada=optimizarOrden2OptDesdeLampa(orden, colaStops);
   sinCoord.forEach(function(s){ optimizada.push(Object.assign({},s,{distTramoKm:0,_geoExact:false})); });
   let cur={lat:BASE_LAMPA.lat,lng:BASE_LAMPA.lng};
   optimizada.forEach(function(s){
@@ -822,7 +848,10 @@ function nearestNeighborDesdeLampa(stops){
   const entregas=stops.filter(function(s){return !s.esRetiro;});
   const retiros=stops.filter(function(s){return s.esRetiro;});
   if(!entregas.length || !retiros.length) return nearestNeighborBase(stops);
-  const ordEnt=nearestNeighborBase(entregas);
+  const clavesEnt=new Set(entregas.map(function(s){ return claveDireccionStop(s); }));
+  const libresPrev=retiros.filter(function(r){ return !clavesEnt.has(claveDireccionStop(r)); });
+  /* los retiros sueltos van al final: la última entrega se elige pensando en ellos (evita volver atrás) */
+  const ordEnt=nearestNeighborBase(entregas, libresPrev);
   const ultimoIdx=new Map();
   ordEnt.forEach(function(s,i){ ultimoIdx.set(claveDireccionStop(s), i); });
   const anclados=new Map(); const libres=[];
@@ -902,11 +931,36 @@ async function refinarOrdenConOSRM(r, estimadoBaseKm){
   const stops=r.stopsOrdenados;
   const conCoord=stops.every(function(s){return Number.isFinite(s.lat)&&Number.isFinite(s.lon);});
   if(!conCoord) return; // si falta alguna coordenada, no se arriesga el orden
+  /* Con 2 o más ventanas horarias la secuencia temporal manda: no se reordena. */
+  if(stops.filter(function(s){return !!s.horario;}).length>=2) return;
   const puntos=[{lat:BASE_LAMPA.lat,lon:BASE_LAMPA.lng}].concat(stops.map(function(s){return {lat:s.lat,lon:s.lon};}));
-  const matriz=await osrm.obtenerMatrizOSRM(puntos);
+  /* Fuente de distancias reales por calle: 1º OSRM (gratis, sin límite); si falla, Mapbox Matrix
+     (con tope mensual de seguridad); si ambos fallan, se queda el orden de línea recta. */
+  let matriz=await osrm.obtenerMatrizOSRM(puntos), fuente='osrm';
+  if(!matriz){ const mm=await mapbox.obtenerMatrizMapbox(puntos); if(mm){ matriz=mm; fuente='mapbox'; } }
   if(!matriz) return;
-  const idxActual=stops.map(function(_,i){return i+1;});
-  const idxOptimo=osrm.twoOptConMatriz(idxActual,matriz);
+  /* Estructura que se respeta: entregas primero; un retiro en la misma dirección de una entrega
+     va pegado a ella; el resto de los retiros va siempre al final. */
+  const nodos=[]; // {idx, extra:[idx...]}  (idx = posición en puntos, 1..n)
+  const libres=[];
+  stops.forEach(function(s,i){
+    const idx=i+1;
+    if(!s.esRetiro){ nodos.push({idx:idx,extra:[]}); }
+    else if(s._retiroEnMismaDireccion && nodos.length){ nodos[nodos.length-1].extra.push(idx); }
+    else libres.push(idx);
+  });
+  if(!nodos.length) return;
+  const secInicial=nodos.map(function(nd){return nd.idx;});
+  const secMejor=mejorarSecuenciaMatriz(secInicial,matriz,libres);
+  const porIdx={}; nodos.forEach(function(nd){ porIdx[nd.idx]=nd; });
+  let idxOptimo=[]; secMejor.forEach(function(i){ idxOptimo.push(i); porIdx[i].extra.forEach(function(e){ idxOptimo.push(e); }); });
+  /* retiros sueltos: siempre al final, el más cercano al punto actual primero */
+  const pend=libres.slice();
+  while(pend.length){
+    const ult=idxOptimo.length?idxOptimo[idxOptimo.length-1]:0;
+    let bi=0,bd=Infinity; pend.forEach(function(q,k){ if(matriz[ult][q]<bd){ bd=matriz[ult][q]; bi=k; } });
+    idxOptimo.push(pend.splice(bi,1)[0]);
+  }
   let anterior=0, totalKm=0;
   idxOptimo.forEach(function(actual){
     totalKm+=matriz[anterior][actual]/1000;
@@ -923,8 +977,8 @@ async function refinarOrdenConOSRM(r, estimadoBaseKm){
   });
   r.stopsOrdenados=nuevoOrden;
   r.distTotalKm=Math.round(totalKm*10)/10;
-  r._ordenFuente='osrm';
-  r._distanciaFuente='osrm';
+  r._ordenFuente=fuente;
+  r._distanciaFuente=fuente;
 }
 
 function capacidadEfectivaDosVueltas(camion){
@@ -2134,5 +2188,5 @@ module.exports = {
   estadoOSRM: osrm.estado,
   validarComunasLista,
   buscarDireccionesMapbox: mapbox.buscarDireccionesMapbox,
-  _interno: { consolidar, nearestNeighborDesdeLampa, distanciaRutaNN, _cruces, zonaOperativaDeStop, corredorOperativoDeStop, volCarga, coordStop, calcularDistanciaKm, BASE_LAMPA, claveDireccionStop, normalizarVolumenLinea },
+  _interno: { mejorarSecuenciaMatriz, optimizarOrden2OptDesdeLampa, refinarOrdenConOSRM, consolidar, nearestNeighborDesdeLampa, distanciaRutaNN, _cruces, zonaOperativaDeStop, corredorOperativoDeStop, volCarga, coordStop, calcularDistanciaKm, BASE_LAMPA, claveDireccionStop, normalizarVolumenLinea },
 };
